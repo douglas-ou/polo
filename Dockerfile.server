@@ -1,5 +1,5 @@
 # =============================================================================
-# Craft Agents Server — multi-platform Docker image
+# Polo AI Server — multi-platform Docker image
 #
 # Build:
 #   docker buildx build -f Dockerfile.server -t craft-agent-server .
