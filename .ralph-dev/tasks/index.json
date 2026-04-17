@@ -1,0 +1,259 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-04-17T18:10:47.684Z",
+  "metadata": {
+    "projectGoal": "Transform Craft Agents into Polo AI Enterprise Edition",
+    "languageConfig": {
+      "language": "typescript",
+      "framework": ""
+    }
+  },
+  "tasks": {
+    "setup.branch": {
+      "status": "pending",
+      "priority": 1,
+      "module": "setup",
+      "description": "Create polo-enterprise Branch",
+      "filePath": "setup/branch.md",
+      "dependencies": [],
+      "estimatedMinutes": 5
+    },
+    "branding.rename": {
+      "status": "pending",
+      "priority": 1,
+      "module": "branding",
+      "description": "Rename Branding: Craft Agents → Polo AI",
+      "filePath": "branding/rename.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 25
+    },
+    "branding.paths": {
+      "status": "pending",
+      "priority": 1,
+      "module": "branding",
+      "description": "Change Data Directory Paths: ~/.craft-agent/ → ~/.polo-ai/",
+      "filePath": "branding/paths.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 20
+    },
+    "enterprise.types": {
+      "status": "pending",
+      "priority": 1,
+      "module": "enterprise",
+      "description": "Define EnterpriseConfig Types and Validation",
+      "filePath": "enterprise/types.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 15
+    },
+    "enterprise.encryption": {
+      "status": "pending",
+      "priority": 1,
+      "module": "enterprise",
+      "description": "Implement Enterprise Config Encryption",
+      "filePath": "enterprise/encryption.md",
+      "dependencies": [
+        "enterprise.types"
+      ],
+      "estimatedMinutes": 25
+    },
+    "enterprise.loader": {
+      "status": "pending",
+      "priority": 1,
+      "module": "enterprise",
+      "description": "Load and Validate Enterprise Config at Startup",
+      "filePath": "enterprise/loader.md",
+      "dependencies": [
+        "enterprise.encryption",
+        "branding.paths"
+      ],
+      "estimatedMinutes": 20
+    },
+    "enterprise.admin-cli": {
+      "status": "pending",
+      "priority": 2,
+      "module": "enterprise",
+      "description": "Admin CLI Tool: polo-enterprise-encrypt",
+      "filePath": "enterprise/admin-cli.md",
+      "dependencies": [
+        "enterprise.encryption"
+      ],
+      "estimatedMinutes": 25
+    },
+    "llm.connection": {
+      "status": "pending",
+      "priority": 1,
+      "module": "llm",
+      "description": "Create Enterprise LLM Connection",
+      "filePath": "llm/connection.md",
+      "dependencies": [
+        "enterprise.loader"
+      ],
+      "estimatedMinutes": 20
+    },
+    "llm.env-setup": {
+      "status": "pending",
+      "priority": 1,
+      "module": "llm",
+      "description": "Set LLM Environment Variables from Enterprise Config",
+      "filePath": "llm/env-setup.md",
+      "dependencies": [
+        "llm.connection"
+      ],
+      "estimatedMinutes": 15
+    },
+    "llm.remove-pi": {
+      "status": "pending",
+      "priority": 2,
+      "module": "llm",
+      "description": "Remove Pi SDK Server and Related Code",
+      "filePath": "llm/remove-pi.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 20
+    },
+    "llm.remove-openai-copilot": {
+      "status": "pending",
+      "priority": 2,
+      "module": "llm",
+      "description": "Remove OpenAI and Copilot Code",
+      "filePath": "llm/remove-openai-copilot.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 15
+    },
+    "llm.remove-claude-oauth": {
+      "status": "pending",
+      "priority": 2,
+      "module": "llm",
+      "description": "Remove Claude OAuth Code",
+      "filePath": "llm/remove-claude-oauth.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 15
+    },
+    "llm.remove-cloud-auth": {
+      "status": "pending",
+      "priority": 2,
+      "module": "llm",
+      "description": "Remove Cloud Provider Auth Types",
+      "filePath": "llm/remove-cloud-auth.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 15
+    },
+    "tools.blacklist": {
+      "status": "pending",
+      "priority": 1,
+      "module": "tools",
+      "description": "Implement Tool Blacklist Enforcement",
+      "filePath": "tools/blacklist.md",
+      "dependencies": [
+        "enterprise.types"
+      ],
+      "estimatedMinutes": 20
+    },
+    "ui.remove-apisetup": {
+      "status": "pending",
+      "priority": 2,
+      "module": "ui",
+      "description": "Delete API Setup Components",
+      "filePath": "ui/remove-apisetup.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 15
+    },
+    "ui.remove-ai-settings": {
+      "status": "pending",
+      "priority": 2,
+      "module": "ui",
+      "description": "Remove AI Settings Page and Navigation",
+      "filePath": "ui/remove-ai-settings.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 20
+    },
+    "ui.skip-onboarding": {
+      "status": "pending",
+      "priority": 2,
+      "module": "ui",
+      "description": "Skip Onboarding for Enterprise Users",
+      "filePath": "ui/skip-onboarding.md",
+      "dependencies": [
+        "enterprise.loader"
+      ],
+      "estimatedMinutes": 15
+    },
+    "ui.remove-model-select": {
+      "status": "pending",
+      "priority": 2,
+      "module": "ui",
+      "description": "Remove Model/Connection Selection from Workspace Dialog",
+      "filePath": "ui/remove-model-select.md",
+      "dependencies": [
+        "setup.branch"
+      ],
+      "estimatedMinutes": 15
+    },
+    "ui.status-bar": {
+      "status": "pending",
+      "priority": 2,
+      "module": "ui",
+      "description": "Update Status Bar and Error Messages",
+      "filePath": "ui/status-bar.md",
+      "dependencies": [
+        "llm.connection"
+      ],
+      "estimatedMinutes": 10
+    },
+    "integration.startup": {
+      "status": "pending",
+      "priority": 1,
+      "module": "integration",
+      "description": "Wire Enterprise Config into Electron Startup",
+      "filePath": "integration/startup.md",
+      "dependencies": [
+        "enterprise.loader",
+        "llm.connection",
+        "llm.env-setup",
+        "tools.blacklist"
+      ],
+      "estimatedMinutes": 20
+    },
+    "integration.cli-server": {
+      "status": "pending",
+      "priority": 2,
+      "module": "integration",
+      "description": "Update CLI and Headless Server for Enterprise Config",
+      "filePath": "integration/cli-server.md",
+      "dependencies": [
+        "enterprise.loader",
+        "llm.env-setup",
+        "tools.blacklist"
+      ],
+      "estimatedMinutes": 20
+    },
+    "docs.enterprise-setup": {
+      "status": "pending",
+      "priority": 3,
+      "module": "docs",
+      "description": "Enterprise Admin Setup Documentation",
+      "filePath": "docs/enterprise-setup.md",
+      "dependencies": [
+        "enterprise.admin-cli"
+      ],
+      "estimatedMinutes": 20
+    }
+  }
+}
