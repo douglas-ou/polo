@@ -16,11 +16,13 @@ import * as React from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import { Globe } from 'lucide-react'
 import { useAtomValue } from 'jotai'
+import { useTranslation, Trans } from 'react-i18next'
 import { Spinner } from '@craft-agent/ui'
 import { cn } from '@/lib/utils'
 import { Kbd } from '@/components/ui/kbd'
 import { getHostname, getThemeLuminance } from '@/components/browser/utils'
-import { browserInstancesAtom } from '@/atoms/browser-pane'
+import { browserInstancesAtom, filterInstancesForWorkspace } from '@/atoms/browser-pane'
+import { useAppShellContext } from '@/context/AppShellContext'
 import type { BrowserInstanceInfo } from '../../../../shared/types'
 
 interface ToolbarStatusSlotProps {
@@ -34,7 +36,18 @@ export function ToolbarStatusSlot({
   showEscapeOverlay,
   sessionId,
 }: ToolbarStatusSlotProps) {
-  const browserInstances = useAtomValue(browserInstancesAtom)
+  // Filter to the active workspace so a session here doesn't surface a
+  // browser-status banner for an agent running in a different workspace.
+  // Accept both the local workspace id (manual tabs) and the remote-mirror
+  // workspace id (tabs stamped by the remote agent over the WS bridge).
+  const { activeWorkspaceId, workspaces } = useAppShellContext()
+  const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId)
+  const remoteWorkspaceId = activeWorkspace?.remoteServer?.remoteWorkspaceId ?? null
+  const allInstances = useAtomValue(browserInstancesAtom)
+  const browserInstances = React.useMemo(
+    () => filterInstancesForWorkspace(allInstances, activeWorkspaceId, remoteWorkspaceId),
+    [allInstances, activeWorkspaceId, remoteWorkspaceId],
+  )
 
   // Find the visible browser instance bound to this session with active agent control.
   // Hidden instances are intentionally excluded so the status slot mirrors actual visibility.
@@ -79,7 +92,10 @@ export function ToolbarStatusSlot({
           } as React.CSSProperties}
         >
           <span className="text-sm font-medium flex items-center gap-1.5">
-            Press <Kbd className="text-inherit bg-current/10">Esc</Kbd> again to interrupt
+            <Trans
+              i18nKey="toolbar.escapeToInterrupt"
+              components={{ kbd: <Kbd className="text-inherit bg-current/10" /> }}
+            />
           </span>
         </motion.div>
       )}
@@ -106,6 +122,7 @@ function BrowserStatusBar({
   instance: BrowserInstanceInfo
   onClick: () => void
 }) {
+  const { t } = useTranslation()
   const hostname = getHostname(instance.url)
   const themeColor = instance.themeColor
   const themeLuminance = themeColor ? getThemeLuminance(themeColor) : null
@@ -182,7 +199,7 @@ function BrowserStatusBar({
         )}
       </span>
       <span className="text-sm font-medium truncate max-w-[200px]">
-        Using {hostname}
+        {t('chat.usingConnection', { name: hostname })}
       </span>
     </motion.button>
   )

@@ -73,6 +73,17 @@ function isExcludedPiModel(modelId: string): boolean {
 }
 
 /**
+ * Check if a Bedrock model ID is a bare Claude model without a region prefix.
+ * Bare IDs like `anthropic.claude-opus-4-7-v1` are rejected by Bedrock which
+ * requires inference profile IDs with a region prefix (`us.`, `eu.`, `global.`).
+ * The Pi SDK catalog includes proper regional variants, so filtering bare models
+ * doesn't remove any usable entries.
+ */
+function isBareBedrockClaudeModel(modelId: string): boolean {
+  return modelId.startsWith('anthropic.claude-');
+}
+
+/**
  * Get Pi models for a specific auth provider directly from the Pi SDK.
  */
 export function getPiModelsForAuthProvider(piAuthProvider: string): ModelDefinition[] {
@@ -81,6 +92,10 @@ export function getPiModelsForAuthProvider(piAuthProvider: string): ModelDefinit
     if (models.length > 0) {
       return models
         .filter(m => !isExcludedPiModel(m.id))
+        // Bedrock: exclude bare Claude models without region prefix — they're
+        // always rejected by Bedrock which requires inference profiles (us.*/eu.*/global.*).
+        // Regional variants from the same catalog are kept.
+        .filter(m => piAuthProvider !== 'amazon-bedrock' || !isBareBedrockClaudeModel(m.id))
         .map(piModelToDefinition);
     }
   } catch {
@@ -114,14 +129,19 @@ export function getAllPiModels(): ModelDefinition[] {
 
 /**
  * Display metadata for Pi SDK providers.
+ *
+ * Keep this keyed by string instead of `KnownProvider` so the UI metadata can
+ * stay ahead of or lag behind the SDK's exact provider union without blocking
+ * typecheck/commits when providers are added or renamed upstream.
  */
-const PI_PROVIDER_DISPLAY: Partial<Record<KnownProvider, { label: string; placeholder: string }>> = {
+const PI_PROVIDER_DISPLAY: Partial<Record<string, { label: string; placeholder: string }>> = {
   'anthropic':              { label: 'Anthropic',          placeholder: 'sk-ant-...' },
   'google':                 { label: 'Google AI Studio',   placeholder: 'AIza...' },
   'openai':                 { label: 'OpenAI',             placeholder: 'sk-...' },
   'openrouter':             { label: 'OpenRouter',         placeholder: 'sk-or-...' },
   'groq':                   { label: 'Groq',               placeholder: 'gsk_...' },
   'mistral':                { label: 'Mistral',            placeholder: 'Paste your key here...' },
+  'deepseek':               { label: 'DeepSeek',           placeholder: 'sk-...' },
   'xai':                    { label: 'xAI (Grok)',         placeholder: 'xai-...' },
   'cerebras':               { label: 'Cerebras',           placeholder: 'csk-...' },
   'amazon-bedrock':         { label: 'Amazon Bedrock',     placeholder: 'AKIA...' },
@@ -140,8 +160,6 @@ const PI_EXCLUDED_PROVIDERS: Set<string> = new Set([
   'github-copilot',
   'openai-codex',
   'google-vertex',
-  'google-gemini-cli',
-  'google-antigravity',
 ]);
 
 /** Info for a Pi provider available in the API key flow. */

@@ -203,6 +203,33 @@ export const updateSessionMetaAtom = atom(
 )
 
 /**
+ * Action atom: replace a session with an authoritative full session payload.
+ *
+ * Use this for data returned by getSessionMessages() or createSession(), where
+ * the `messages` array is known to represent the loaded transcript. Keeping the
+ * full session atom and loadedSessionsAtom in one write prevents the chat panel
+ * from hiding real messages behind a stale lazy-loading spinner.
+ */
+export const replaceLoadedSessionAtom = atom(
+  null,
+  (get, set, session: Session) => {
+    set(sessionAtomFamily(session.id), session)
+
+    const metaMap = get(sessionMetaMapAtom)
+    const newMetaMap = new Map(metaMap)
+    newMetaMap.set(session.id, extractSessionMeta(session))
+    set(sessionMetaMapAtom, newMetaMap)
+
+    const loadedSessions = get(loadedSessionsAtom)
+    if (!loadedSessions.has(session.id)) {
+      const newLoadedSessions = new Set(loadedSessions)
+      newLoadedSessions.add(session.id)
+      set(loadedSessionsAtom, newLoadedSessions)
+    }
+  }
+)
+
+/**
  * Action atom: append message to session (for streaming)
  * Optimized to only update the specific session
  * Note: Does NOT update lastMessageAt - caller must handle timestamp updates
@@ -291,6 +318,85 @@ export const initializeSessionsAtom = atom(
     // Sessions from getSessions() have empty messages: [] to save memory
     // Messages are lazy-loaded via ensureSessionMessagesLoadedAtom when session is opened
     // This reduces initial memory usage from ~500MB to ~50MB for 300+ sessions
+  }
+)
+
+/**
+ * Action atom: refresh session metadata after a stale reconnect.
+ *
+ * Unlike initializeSessionsAtom (which resets everything for workspace switches),
+ * this preserves messages for already-loaded sessions and only marks overwritten
+ * metadata-only sessions as unloaded for lazy re-fetching.
+ *
+ * All cross-atom mutations happen inside a single write transaction so that
+ * React subscribers see one consistent update instead of intermediate states.
+ */
+export const refreshSessionsMetadataAtom = atom(
+  null,
+  (
+    get,
+    set,
+    payload: { sessions: Session[]; loadedSessionIds: Set<string>; removeMissing?: boolean }
+  ): Map<string, SessionMeta> => {
+    const { sessions, loadedSessionIds, removeMissing = true } = payload
+
+    // Remove stale sessions only for authoritative refreshes. Stale reconnect
+    // recovery can receive a transient partial list immediately after sleep/wake;
+    // treating that as authoritative is what makes the sidebar collapse to the
+    // single active session. In non-destructive mode we upsert returned sessions
+    // and preserve missing metadata until a confirmed delete/workspace reload.
+    const currentIds = get(sessionIdsAtom)
+    const latestIds = new Set(sessions.map(s => s.id))
+    if (removeMissing) {
+      for (const staleId of currentIds) {
+        if (!latestIds.has(staleId)) {
+          set(removeSessionAtom, staleId)
+        }
+      }
+    }
+
+    // Update each session atom, preserving messages for loaded sessions
+    const unloadedIds: string[] = []
+    for (const session of sessions) {
+      const currentSession = get(sessionAtomFamily(session.id))
+      const shouldPreserveMessages = !!currentSession && loadedSessionIds.has(session.id)
+      const nextSession = shouldPreserveMessages && currentSession
+        ? { ...session, messages: currentSession.messages }
+        : session
+
+      set(sessionAtomFamily(session.id), nextSession)
+
+      // Track sessions that lost their messages so lazy-loading re-fetches them
+      if (!shouldPreserveMessages && loadedSessionIds.has(session.id)) {
+        unloadedIds.push(session.id)
+      }
+    }
+
+    // Remove overwritten sessions from loadedSessionsAtom
+    if (unloadedIds.length > 0) {
+      const nextLoaded = new Set(get(loadedSessionsAtom))
+      for (const id of unloadedIds) nextLoaded.delete(id)
+      set(loadedSessionsAtom, nextLoaded)
+    }
+
+    // Build and set metadata map. Non-destructive refresh starts from the
+    // existing map so sessions omitted by a transient partial response remain
+    // visible. Returned sessions are still authoritative for their own fields.
+    const nextMetaMap = removeMissing
+      ? new Map<string, SessionMeta>()
+      : new Map(get(sessionMetaMapAtom))
+    for (const session of sessions) {
+      nextMetaMap.set(session.id, extractSessionMeta(session))
+    }
+    set(sessionMetaMapAtom, nextMetaMap)
+
+    // Set ordered IDs from the metadata map we actually exposed to the UI.
+    const nextIds = Array.from(nextMetaMap.values())
+      .sort((a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0))
+      .map(s => s.id)
+    set(sessionIdsAtom, nextIds)
+
+    return nextMetaMap
   }
 )
 

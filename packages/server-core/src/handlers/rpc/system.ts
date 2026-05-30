@@ -4,8 +4,9 @@ import { homedir } from 'os'
 import { execSync } from 'child_process'
 import { RPC_CHANNELS } from '@craft-agent/shared/protocol'
 import { getWorkspaceByNameOrId, getGitBashPath, setGitBashPath, clearGitBashPath } from '@craft-agent/shared/config'
+import { classifyExternalUrl, formatBlockedUrlError } from '@craft-agent/shared/utils/url-safety'
 import { isUsableGitBashPath, validateGitBashPath } from '@craft-agent/server-core/services'
-import { validateFilePath } from '@craft-agent/server-core/handlers'
+import { validateFilePath, getWorkspaceAllowedDirs } from '@craft-agent/server-core/handlers'
 import type { RpcServer } from '@craft-agent/server-core/transport'
 import type { HandlerDeps } from '../handler-deps'
 import {
@@ -280,9 +281,14 @@ export function registerSystemCoreHandlers(server: RpcServer, deps: HandlerDeps)
   server.handle(RPC_CHANNELS.shell.OPEN_URL, async (ctx, url: string) => {
     deps.platform.logger.info('[OPEN_URL] Received request:', url)
     try {
+      const classification = classifyExternalUrl(url)
+      if (classification.kind === 'dangerous') {
+        throw new Error(formatBlockedUrlError(classification))
+      }
+
       const parsed = new URL(url)
 
-      if (parsed.protocol === 'craftagents:') {
+      if (classification.kind === 'internal-deeplink') {
         const deepLink = parseInternalCraftAgentsDeepLink(parsed)
 
         if (deepLink?.handledNoop) {
@@ -311,10 +317,6 @@ export function registerSystemCoreHandlers(server: RpcServer, deps: HandlerDeps)
         return
       }
 
-      if (!['http:', 'https:', 'mailto:', 'craftdocs:'].includes(parsed.protocol)) {
-        throw new Error('Only http, https, mailto, craftdocs, craftagents URLs are allowed')
-      }
-
       const result = await requestClientOpenExternal(server, ctx.clientId, url)
       if (!result.opened) {
         deps.platform.logger.error(`[OPEN_URL] Client capability failed: ${result.error}`)
@@ -330,8 +332,10 @@ export function registerSystemCoreHandlers(server: RpcServer, deps: HandlerDeps)
   server.handle(RPC_CHANNELS.shell.OPEN_FILE, async (ctx, path: string) => {
     assertLocalWorkspace(ctx, 'Open file')
     try {
-      const absolutePath = resolve(path)
-      const safePath = await validateFilePath(absolutePath)
+      // Expand ~ before resolve() — resolve() treats ~ as a literal path component
+      const expanded = path.startsWith('~') ? path.replace(/^~/, homedir()) : path
+      const absolutePath = resolve(expanded)
+      const safePath = await validateFilePath(absolutePath, getWorkspaceAllowedDirs(ctx.workspaceId))
       const result = await requestClientOpenPath(server, ctx.clientId, safePath)
       if (result.error) throw new Error(result.error)
     } catch (error) {
@@ -344,8 +348,9 @@ export function registerSystemCoreHandlers(server: RpcServer, deps: HandlerDeps)
   server.handle(RPC_CHANNELS.shell.SHOW_IN_FOLDER, async (ctx, path: string) => {
     assertLocalWorkspace(ctx, 'Show in folder')
     try {
-      const absolutePath = resolve(path)
-      const safePath = await validateFilePath(absolutePath)
+      const expanded = path.startsWith('~') ? path.replace(/^~/, homedir()) : path
+      const absolutePath = resolve(expanded)
+      const safePath = await validateFilePath(absolutePath, getWorkspaceAllowedDirs(ctx.workspaceId))
       await requestClientShowInFolder(server, ctx.clientId, safePath)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error'

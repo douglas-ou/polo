@@ -1,7 +1,6 @@
 import * as React from 'react'
 import { useTranslation } from "react-i18next"
 import { Command as CommandPrimitive } from 'cmdk'
-import { toast } from 'sonner'
 import { AnimatePresence, motion } from 'motion/react'
 import {
   Paperclip,
@@ -10,7 +9,9 @@ import {
   Check,
   DatabaseZap,
   ChevronDown,
+  ChevronUp,
   AlertCircle,
+  Image as ImageIcon,
   X,
 } from 'lucide-react'
 import { Icon_Home, Icon_Folder, Spinner } from '@craft-agent/ui'
@@ -53,17 +54,26 @@ import {
 } from '@/components/ui/styled-dropdown'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
 import { cn } from '@/lib/utils'
+import { coerceInputText } from '@/lib/input-text'
 import { isMac, PATH_SEP, getPathBasename } from '@/lib/platform'
 import { applySmartTypography } from '@/lib/smart-typography'
 import { AttachmentPreview } from '../AttachmentPreview'
+import { ImageSupportWarningBanner } from './ImageSupportWarningBanner'
 import { ANTHROPIC_MODELS, getModelShortName, getModelDisplayName, getModelContextWindow, type ModelDefinition } from '@config/models'
-import { resolveEffectiveConnectionSlug, isCompatProvider } from '@config/llm-connections'
+import {
+  resolveEffectiveConnectionSlug,
+  isCompatProvider,
+  modelSupportsImages,
+} from '@config/llm-connections'
 import { useOptionalAppShellContext } from '@/context/AppShellContext'
 import { EditPopover, getEditConfig } from '@/components/ui/EditPopover'
 import { SourceAvatar } from '@/components/ui/source-avatar'
 import { SourceSelectorPopover } from '@/components/ui/SourceSelectorPopover'
+import { CompactSourceSelector } from '@/components/ui/CompactSourceSelector'
+import { CompactWorkingDirectorySelector } from '@/components/ui/CompactWorkingDirectorySelector'
 import { ConnectionIcon } from '@/components/icons/ConnectionIcon'
 import { FreeFormInputContextBadge } from './FreeFormInputContextBadge'
+import { derivePickerMode } from './picker-mode'
 import type { FileAttachment, LoadedSource, LoadedSkill } from '../../../../shared/types'
 import type { PermissionMode } from '@craft-agent/shared/agent/modes'
 import { type ThinkingLevel, THINKING_LEVELS, getThinkingLevelNameKey } from '@craft-agent/shared/agent/thinking-levels'
@@ -76,26 +86,16 @@ import { clearPendingFocusForSession, consumePendingFocusForSession } from './fo
 import {
   getRecentWorkingDirs,
   addRecentWorkingDir,
-  removeRecentWorkingDir,
 } from './working-directory-history'
+import { useWorkingDirectoryState } from './use-working-directory-state'
 import { CompactPermissionModeSelector } from './CompactPermissionModeSelector'
-
-/**
- * Format token count for display (e.g., 1500 -> "1.5k", 200000 -> "200k")
- */
-function formatTokenCount(tokens: number): string {
-  if (tokens >= 1000000) {
-    return `${(tokens / 1000000).toFixed(1)}M`
-  }
-  if (tokens >= 1000) {
-    return `${(tokens / 1000).toFixed(tokens >= 10000 ? 0 : 1)}k`
-  }
-  return tokens.toString()
-}
-
-function stripPiPrefixForDisplay(value: string): string {
-  return value.startsWith('pi/') ? value.slice(3) : value
-}
+import { CompactModelSelector } from './CompactModelSelector'
+import {
+  formatTokenCount,
+  groupConnectionsByProvider,
+  stripPiPrefixForDisplay,
+} from './model-picker-helpers'
+import { useModelVisionToggle } from './useModelVisionToggle'
 
 function formatFollowUpChipText(text: string, fallback: string, maxLength = 50): string {
   const normalized = text.replace(/\s+/g, ' ').trim()
@@ -164,6 +164,10 @@ export interface FreeFormInputProps {
   inputValue?: string
   /** Callback when input value changes */
   onInputChange?: (value: string) => void
+  /** Persisted attachment draft for this session (seeds local state on session switch) */
+  attachmentsValue?: FileAttachment[]
+  /** Callback when attachment list changes (add, remove, clear on send) */
+  onAttachmentsChange?: (attachments: FileAttachment[]) => void
   /** When true, removes container styling (shadow, bg, rounded) - used when wrapped by InputContainer */
   unstyled?: boolean
   /** Callback when component height changes (for external animation sync) */
@@ -218,8 +222,20 @@ export interface FreeFormInputProps {
   onFollowUpClick?: (item: FollowUpInputItem, anchor?: { x: number; y: number }) => void
   /** Callback when user clicks the follow-up index badge */
   onFollowUpIndexClick?: (item: FollowUpInputItem) => void
-  /** Enable compact mode - hides attach, sources, working directory for popover embedding */
+  /**
+   * Compact-footer layout. Used by EditPopover (popover embedding) and by
+   * ChatPage in auto-compact / WebUI mobile mode. The popover case hides the
+   * model picker; the auto-compact case opts the compact picker in via
+   * `enableCompactModelPicker`.
+   */
   compactMode?: boolean
+  /**
+   * When `compactMode` is true, render the compact (drawer-based) model
+   * selector next to the permission-mode pill. Defaults to false so that
+   * EditPopover (which has no use for a model picker) keeps its current
+   * behavior.
+   */
+  enableCompactModelPicker?: boolean
   // Connection selection (hierarchical connection → model selector)
   /** Current LLM connection slug (locked after first message) */
   currentConnection?: string
@@ -227,6 +243,14 @@ export interface FreeFormInputProps {
   onConnectionChange?: (connectionSlug: string) => void
   /** When true, the session's locked connection has been removed */
   connectionUnavailable?: boolean
+  /**
+   * True when the input is collapsed because the agent is processing in
+   * compact mode and the user hasn't expanded it yet. Owned by
+   * `InputContainer`; toggle back via `onRequestExpand`.
+   */
+  isCollapsedInCompact?: boolean
+  /** Callback fired when the user clicks or hovers the collapsed-input strip. */
+  onRequestExpand?: () => void
 }
 
 /**
@@ -255,6 +279,8 @@ export function FreeFormInput({
   enabledModes = ['safe', 'ask', 'allow-all'],
   inputValue,
   onInputChange,
+  attachmentsValue,
+  onAttachmentsChange,
   unstyled = false,
   onHeightChange,
   onFocusChange,
@@ -278,9 +304,12 @@ export function FreeFormInput({
   onFollowUpClick,
   onFollowUpIndexClick,
   compactMode = false,
+  enableCompactModelPicker = false,
   currentConnection,
   onConnectionChange,
   connectionUnavailable = false,
+  isCollapsedInCompact = false,
+  onRequestExpand,
 }: FreeFormInputProps) {
   const { t } = useTranslation()
 
@@ -315,6 +344,16 @@ export function FreeFormInput({
     if (conn.models && conn.models.length > 1) return null
     return conn.defaultModel ?? null
   }, [currentConnection, workspaceDefaultConnection, llmConnections])
+
+  // Decide which of the four picker UIs to render. The `switcher` branch
+  // wins over `locked-single` so users with a single-model pi_compat default
+  // can still reach the connection list on a fresh session (#727).
+  const pickerMode = derivePickerMode({
+    connectionUnavailable,
+    connectionDefaultModel,
+    isEmptySession,
+    connectionCount: llmConnections.length,
+  })
 
   // Compute available models from the effective connection.
   // All connections have models populated by backfillAllConnectionModels().
@@ -351,28 +390,19 @@ export function FreeFormInput({
       // Fallback: use helper function to format unknown model IDs nicely
       return stripPiPrefixForDisplay(getModelDisplayName(modelToDisplay))
     }
-    return typeof model === 'string' ? stripPiPrefixForDisplay(model) : model.name
+    if (typeof model === 'string') return stripPiPrefixForDisplay(model)
+    // Defensive: partial entries (custom-endpoint user-config or vision-toggle
+    // promotions) may lack `name`. Fall back to the id so the trigger button
+    // never goes blank.
+    return model.name ?? stripPiPrefixForDisplay(model.id)
   }, [availableModels, currentModel, connectionDefaultModel])
 
-  // Group connections by provider type for hierarchical dropdown
+  // Group connections by provider type for hierarchical dropdown.
   // Each provider (Anthropic, Pi) can have multiple connections (API Key, OAuth, etc.)
-  const connectionsByProvider = React.useMemo(() => {
-    const groups: Record<string, typeof llmConnections> = {
-      'Anthropic': [],
-      'Craft Agents Backend': [],
-    }
-    for (const conn of llmConnections) {
-      const provider = conn.providerType || 'anthropic'
-      // Group by SDK: only 'anthropic' uses Claude Agent SDK
-      if (provider === 'anthropic') {
-        groups['Anthropic'].push(conn)
-      } else if (provider === 'pi' || provider === 'pi_compat') {
-        groups['Craft Agents Backend'].push(conn)
-      }
-    }
-    // Return only non-empty groups
-    return Object.entries(groups).filter(([, conns]) => conns.length > 0)
-  }, [llmConnections])
+  const connectionsByProvider = React.useMemo(
+    () => groupConnectionsByProvider(llmConnections),
+    [llmConnections],
+  )
 
   // Find current connection details for display
   const currentConnectionDetails = React.useMemo(() => {
@@ -439,13 +469,44 @@ export function FreeFormInput({
   // Performance optimization: Always use internal state for typing to avoid parent re-renders
   // Sync FROM parent on mount/change (for restoring drafts)
   // Sync TO parent on blur/submit (debounced persistence)
-  const [input, setInput] = React.useState(inputValue ?? '')
-  const [attachments, setAttachments] = React.useState<FileAttachment[]>([])
+  const [input, setInput] = React.useState(() => coerceInputText(inputValue))
+  const [attachments, setAttachments] = React.useState<FileAttachment[]>(attachmentsValue ?? [])
 
   // Ref to track current attachments for use in event handlers (avoids stale closure issues)
   const attachmentsRef = React.useRef<FileAttachment[]>([])
   React.useEffect(() => {
     attachmentsRef.current = attachments
+  }, [attachments])
+
+  // Seed from parent when `attachmentsValue` changes (e.g., switching sessions).
+  // `skipPersistRef` tells the save effect below that the next `attachments` change
+  // is a prop-driven seed, not user intent — otherwise we'd echo the seed back to
+  // the parent and risk persisting A's attachments under B's sessionId.
+  const attachmentsRefsKey = React.useMemo(() => {
+    if (!attachmentsValue) return ''
+    return attachmentsValue.map(a => a.path).join('|')
+  }, [attachmentsValue])
+  const prevAttachmentsRefsKey = React.useRef(attachmentsRefsKey)
+  const skipPersistRef = React.useRef(true) // treat initial mount as a prop-seed
+  React.useEffect(() => {
+    if (attachmentsValue === undefined) return
+    if (attachmentsRefsKey === prevAttachmentsRefsKey.current) return
+    prevAttachmentsRefsKey.current = attachmentsRefsKey
+    skipPersistRef.current = true
+    setAttachments(attachmentsValue)
+  }, [attachmentsValue, attachmentsRefsKey])
+
+  // Persist user-initiated attachment changes back to the parent. The parent stores
+  // refs (path + name) and debounces the disk write, so we fire eagerly on every
+  // change — add/remove/send-clear.
+  const onAttachmentsChangeRef = React.useRef(onAttachmentsChange)
+  onAttachmentsChangeRef.current = onAttachmentsChange
+  React.useEffect(() => {
+    if (skipPersistRef.current) {
+      skipPersistRef.current = false
+      return
+    }
+    onAttachmentsChangeRef.current?.(attachments)
   }, [attachments])
 
   // Optimistic state for source selection - updates UI immediately before IPC round-trip completes
@@ -466,11 +527,13 @@ export function FreeFormInput({
   }, [enabledSourceSlugs])
 
   // Sync from parent when inputValue changes externally (e.g., switching sessions)
-  const prevInputValueRef = React.useRef(inputValue)
+  const prevInputValueRef = React.useRef(coerceInputText(inputValue))
   React.useEffect(() => {
-    if (inputValue !== undefined && inputValue !== prevInputValueRef.current) {
-      setInput(inputValue)
-      prevInputValueRef.current = inputValue
+    if (inputValue === undefined) return
+    const nextInputValue = coerceInputText(inputValue)
+    if (nextInputValue !== prevInputValueRef.current) {
+      setInput(nextInputValue)
+      prevInputValueRef.current = nextInputValue
     }
   }, [inputValue])
 
@@ -567,7 +630,7 @@ export function FreeFormInput({
       const targetSessionId = e.detail?.sessionId
       if (!shouldHandleScopedInputEvent({ sessionId, isFocusedPanel, targetSessionId })) return
 
-      const { text } = e.detail
+      const text = coerceInputText(e.detail?.text)
       setInput(text)
       syncToParent(text)
       // Focus the input after inserting
@@ -588,6 +651,8 @@ export function FreeFormInput({
     onInputChange?.('')
     prevInputValueRef.current = ''
   }, [onInputChange])
+
+  const handleToggleModelVision = useModelVisionToggle()
 
   const consumeInputDraftSnapshot = React.useCallback((): string => {
     const snapshot = input.trim()
@@ -960,11 +1025,11 @@ export function FreeFormInput({
 
     // Store the prefill text (e.g., "Test" from "#Test") to pre-fill the popover
     // Format: "Add new label {prefill}" so user can just press enter or modify
-    setAddLabelPrefill(prefill ? `Add new label ${prefill}` : '')
+    setAddLabelPrefill(prefill ? t('labels.addNewLabel', { prefill }) : '')
 
     // Open the EditPopover for label creation
     setAddLabelPopoverOpen(true)
-  }, [workspaceRootPath, inlineLabel, syncToParent])
+  }, [workspaceRootPath, inlineLabel, syncToParent, t])
 
   // Memoize the add-label config so the EditPopover doesn't recreate on every render
   const addLabelEditConfig = React.useMemo(() => {
@@ -986,16 +1051,17 @@ export function FreeFormInput({
     return () => observer.disconnect()
   }, [onHeightChange])
 
-  // In compact mode, immediately report collapsed height when processing state changes
-  // This ensures smooth animation timing when input collapses/expands
+  // In compact mode, immediately report collapsed height when the input is
+  // collapsed during processing. This ensures smooth animation timing.
+  // When the user expands (or processing ends), the ResizeObserver takes
+  // over and reports the actual rendered height.
   React.useEffect(() => {
-    if (!onHeightChange || !compactMode) return
-    if (isProcessing) {
+    if (!onHeightChange) return
+    if (isCollapsedInCompact) {
       // Collapsed state - only bottom bar visible (~44px)
       onHeightChange(44)
     }
-    // When not processing, ResizeObserver will report the full height
-  }, [compactMode, isProcessing, onHeightChange])
+  }, [isCollapsedInCompact, onHeightChange])
 
   // Check if running in Electron environment (has electronAPI)
   const hasElectronAPI = typeof window !== 'undefined' && !!window.electronAPI
@@ -1064,6 +1130,11 @@ export function FreeFormInput({
 
   // Helper to read a File using FileReader API
   const readFileAsAttachment = async (file: File, overrideName?: string): Promise<FileAttachment | null> => {
+    // Capture the absolute OS path at attach time. Works for <input type="file"> and
+    // OS drag-drop; returns null for clipboard paste and web-drag (no disk origin).
+    // When null, the draft layer falls back to persisting content inline (Track C).
+    const realPath = hasElectronAPI ? window.electronAPI.getFilePath?.(file) ?? null : null
+
     return new Promise((resolve) => {
       const reader = new FileReader()
       reader.onload = async () => {
@@ -1105,7 +1176,7 @@ export function FreeFormInput({
 
         resolve({
           type,
-          path: fileName,
+          path: realPath ?? fileName,
           name: fileName,
           mimeType,
           base64,
@@ -1201,9 +1272,11 @@ export function FreeFormInput({
       }
     }
 
+    const attachmentSnapshot = attachments
+
     onSubmit(
       input.trim(),
-      attachments.length > 0 ? attachments : undefined,
+      attachmentSnapshot.length > 0 ? attachmentSnapshot : undefined,
       mentions.skills.length > 0 ? mentions.skills : undefined
     )
     setInput('')
@@ -1211,6 +1284,7 @@ export function FreeFormInput({
     // Clear draft immediately (cancel any pending debounced sync)
     if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current)
     onInputChange?.('')
+    onAttachmentsChange?.([])
     prevInputValueRef.current = ''
 
     // Restore focus after state updates
@@ -1219,7 +1293,7 @@ export function FreeFormInput({
     })
 
     return true
-  }, [input, attachments, followUpItems, disabled, disableSend, onInputChange, onSubmit, skills, sources, optimisticSourceSlugs, onSourcesChange, onWorkingDirectoryChange, homeDir])
+  }, [input, attachments, followUpItems, disabled, disableSend, onInputChange, onAttachmentsChange, onSubmit, skills, sources, optimisticSourceSlugs, onSourcesChange, onWorkingDirectoryChange, homeDir])
 
   // Listen for craft:submit-input events (simulate pressing the Send button)
   React.useEffect(() => {
@@ -1324,11 +1398,12 @@ export function FreeFormInput({
 
   // Handle input changes from RichTextInput
   const handleInputChange = React.useCallback((value: string) => {
+    const nextValue = coerceInputText(value)
     // Get previous input value before updating state
     const prevValue = inputRef.current
 
-    setInput(value)
-    syncToParent(value) // Debounced sync to parent for draft persistence
+    setInput(nextValue)
+    syncToParent(nextValue) // Debounced sync to parent for draft persistence
 
     // Sync source selection when mentions are removed from input
     if (onSourcesChange) {
@@ -1336,7 +1411,7 @@ export function FreeFormInput({
 
       // Parse mentions from previous and current input
       const prevMentions = parseMentions(prevValue, [], sourceSlugs)
-      const currMentions = parseMentions(value, [], sourceSlugs)
+      const currMentions = parseMentions(nextValue, [], sourceSlugs)
 
       // Remove sources that were mentioned before but not anymore
       const removedSources = prevMentions.sources.filter(slug => !currMentions.sources.includes(slug))
@@ -1350,22 +1425,24 @@ export function FreeFormInput({
 
   // Handle input with cursor position (for menu detection)
   const handleRichInput = React.useCallback((value: string, cursorPosition: number) => {
+    const nextValue = coerceInputText(value)
+
     // Update inline slash command state
-    inlineSlash.handleInputChange(value, cursorPosition)
+    inlineSlash.handleInputChange(nextValue, cursorPosition)
 
     // Update inline mention state (for @mentions - skills, sources, folders)
-    inlineMention.handleInputChange(value, cursorPosition)
+    inlineMention.handleInputChange(nextValue, cursorPosition)
 
     // Update inline label state (for #labels)
-    inlineLabel.handleInputChange(value, cursorPosition)
+    inlineLabel.handleInputChange(nextValue, cursorPosition)
 
     // Auto-capitalize first letter (but not for slash commands, @mentions, or #labels)
     // Only if autoCapitalisation setting is enabled
-    let newValue = value
-    if (autoCapitalisation && value.length > 0 && value.charAt(0) !== '/' && value.charAt(0) !== '@' && value.charAt(0) !== '#') {
-      const capitalizedFirst = value.charAt(0).toUpperCase()
-      if (capitalizedFirst !== value.charAt(0)) {
-        newValue = capitalizedFirst + value.slice(1)
+    let newValue = nextValue
+    if (autoCapitalisation && nextValue.length > 0 && nextValue.charAt(0) !== '/' && nextValue.charAt(0) !== '@' && nextValue.charAt(0) !== '#') {
+      const capitalizedFirst = nextValue.charAt(0).toUpperCase()
+      if (capitalizedFirst !== nextValue.charAt(0)) {
+        newValue = capitalizedFirst + nextValue.slice(1)
         // Set cursor position BEFORE state update so it's used when useEffect syncs the value
         richInputRef.current?.setSelectionRange(cursorPosition, cursorPosition)
         setInput(newValue)
@@ -1375,7 +1452,7 @@ export function FreeFormInput({
     }
 
     // Apply smart typography (-> to →, etc.)
-    const typography = applySmartTypography(value, cursorPosition)
+    const typography = applySmartTypography(nextValue, cursorPosition)
     if (typography.replaced) {
       newValue = typography.text
       // Set cursor position BEFORE state update so it's used when useEffect syncs the value
@@ -1461,6 +1538,17 @@ export function FreeFormInput({
 
   const hasContent = input.trim() || attachments.length > 0 || followUpItems.length > 0
 
+  // Pre-flight image-support check: warn when staged images would be silently
+  // stripped by Pi SDK because the active custom-endpoint model is text-only.
+  // Gate on pi_compat — built-in catalogs (anthropic/pi) are owned by the SDK
+  // and we can't repair them from the UI here.
+  const hasStagedImages = attachments.some(a => a.type === 'image' || a.mimeType?.startsWith('image/'))
+  const showVisionWarning =
+    hasStagedImages
+    && !!effectiveConnectionDetails
+    && isCompatProvider(effectiveConnectionDetails.providerType)
+    && !modelSupportsImages(effectiveConnectionDetails, currentModel)
+
   return (
     <form onSubmit={handleSubmit}>
       <div
@@ -1517,24 +1605,36 @@ export function FreeFormInput({
         />
 
         {/* Controlled EditPopover for "Add New Label" — opens when user selects
-            the option from the # menu with no matches */}
+            the option from the # menu with no matches.
+            Spread the full config so optional fields like `inlineExecution`,
+            `displayLabel`, and `displayLabelKey` reach the popover. The previous
+            cherry-pick dropped `inlineExecution: true`, which made the popover
+            fall back to the same-window deep-link path; that worked inside
+            Electron but launched the desktop app from the WebUI via `craftagents://`.
+            Match the AppShell pattern (which already uses spread). */}
         {addLabelEditConfig && (
           <EditPopover
             trigger={<span className="absolute top-0 left-0 w-0 h-0 overflow-hidden" />}
             open={addLabelPopoverOpen}
             onOpenChange={setAddLabelPopoverOpen}
-            context={addLabelEditConfig.context}
-            example={addLabelEditConfig.example}
-            overridePlaceholder={addLabelEditConfig.overridePlaceholder}
+            {...addLabelEditConfig}
             defaultValue={addLabelPrefill}
-            model={addLabelEditConfig.model}
-            systemPromptPreset={addLabelEditConfig.systemPromptPreset}
             secondaryAction={workspaceRootPath ? {
               label: 'Edit File',
               filePath: `${workspaceRootPath}/labels/config.json`,
             } : undefined}
             side="top"
             align="start"
+          />
+        )}
+
+        {/* Pre-flight image-support warning — only for pi_compat connections
+            where the renderer can both detect text-only models and offer to
+            flip the per-model supportsImages override on the spot. */}
+        {showVisionWarning && effectiveConnectionDetails && (
+          <ImageSupportWarningBanner
+            modelName={currentModelDisplayName}
+            onEnable={() => handleToggleModelVision(effectiveConnectionDetails.slug, currentModel, true)}
           />
         )}
 
@@ -1631,8 +1731,9 @@ export function FreeFormInput({
         </AnimatePresence>
 
         {/* Rich Text Input with inline mention badges */}
-        {/* In compact mode, hide input while processing (collapses to just bottom bar) */}
-        {!(compactMode && isProcessing) && (
+        {/* In compact mode, hide input while the agent is processing — until the
+            user clicks / hovers the collapsed bar to expand it back. */}
+        {!isCollapsedInCompact && (
         <RichTextInput
           ref={richInputRef}
           value={input}
@@ -1678,28 +1779,42 @@ export function FreeFormInput({
             onChange={handleFileInputChange}
           />
 
-          {/* Compact mode: permission mode drawer + standard icon badges for attach/sources/working dir */}
+          {/* Compact mode: permission mode drawer + standard icon badges for attach/sources/working dir.
+              Wrapper absorbs all squeeze so the model label truncates first and the send button stays
+              anchored to the right (craft-agents-oss#798). overflow-hidden is safe — Radix Drawer /
+              dropdowns inside render via portals, so they aren't clipped. */}
           {compactMode && (
-          <>
+          <div className="flex items-center gap-1 min-w-0 shrink overflow-hidden">
           {onPermissionModeChange && (
             <CompactPermissionModeSelector
               permissionMode={permissionMode}
               onPermissionModeChange={onPermissionModeChange}
             />
           )}
+          {enableCompactModelPicker && (
+            <CompactModelSelector
+              currentModel={currentModel}
+              currentConnection={currentConnection}
+              onModelChange={onModelChange}
+              onConnectionChange={onConnectionChange}
+              thinkingLevel={thinkingLevel}
+              onThinkingLevelChange={onThinkingLevelChange}
+              isEmptySession={isEmptySession}
+              connectionUnavailable={connectionUnavailable}
+              contextStatus={contextStatus}
+            />
+          )}
           <FreeFormInputContextBadge
             icon={<Paperclip className="h-4 w-4" />}
             label={attachments.length > 0
-              ? attachments.length === 1
-                ? "1 file"
-                : `${attachments.length} files`
-              : "Attach"
+              ? t("chat.filesCount", { count: attachments.length })
+              : t("chat.attach")
             }
             isExpanded={false}
             hasSelection={attachments.length > 0}
             showChevron={false}
             onClick={handleAttachClick}
-            tooltip="Attach files"
+            tooltip={t("chat.attachFilesTooltip")}
             disabled={disabled}
           />
           {onSourcesChange && (
@@ -1742,11 +1857,11 @@ export function FreeFormInput({
                 }
                 label={
                   optimisticSourceSlugs.length === 0
-                    ? "Sources"
+                    ? t("chat.sourcesTooltip")
                     : (() => {
                         const enabledSources = sources.filter(s => optimisticSourceSlugs.includes(s.config.slug))
                         if (enabledSources.length === 1) return enabledSources[0].config.name
-                        return `${enabledSources.length} sources`
+                        return t("chat.sourcesCount", { count: enabledSources.length })
                       })()
                 }
                 isExpanded={false}
@@ -1755,12 +1870,11 @@ export function FreeFormInput({
                 isOpen={sourceDropdownOpen}
                 disabled={disabled}
                 onClick={() => setSourceDropdownOpen(prev => !prev)}
-                tooltip="Sources"
+                tooltip={t("chat.sourcesTooltip")}
               />
-              <SourceSelectorPopover
+              <CompactSourceSelector
                 open={sourceDropdownOpen}
                 onOpenChange={setSourceDropdownOpen}
-                anchorRef={sourceButtonRef}
                 sources={sources}
                 selectedSlugs={optimisticSourceSlugs}
                 onToggleSlug={(slug) => {
@@ -1775,7 +1889,7 @@ export function FreeFormInput({
             </div>
           )}
           {onWorkingDirectoryChange && (
-            <WorkingDirectoryBadge
+            <CompactWorkingDirectorySelector
               workingDirectory={workingDirectory}
               onWorkingDirectoryChange={onWorkingDirectoryChange}
               sessionFolderPath={sessionFolderPath}
@@ -1783,7 +1897,7 @@ export function FreeFormInput({
               workspaceId={workspaceId}
             />
           )}
-          </>
+          </div>
           )}
 
           {/* Desktop: full badges row with labels and working directory */}
@@ -1793,9 +1907,7 @@ export function FreeFormInput({
           <FreeFormInputContextBadge
             icon={<Paperclip className="h-4 w-4" />}
             label={attachments.length > 0
-              ? attachments.length === 1
-                ? "1 file"
-                : `${attachments.length} files`
+              ? t("chat.filesCount", { count: attachments.length })
               : t("chat.attachFiles")
             }
             isExpanded={isEmptySession}
@@ -1896,8 +2008,22 @@ export function FreeFormInput({
           </div>
           )}
 
-          {/* Spacer */}
-          <div className="flex-1" />
+          {/* Spacer — doubles as a tap / hover target while the input is
+              collapsed during processing in compact mode, so the user can
+              type a follow-up without waiting for the agent to finish. */}
+          {isCollapsedInCompact ? (
+            <button
+              type="button"
+              onClick={onRequestExpand}
+              onMouseEnter={onRequestExpand}
+              aria-label={t('chat.tapToType')}
+              className="flex-1 h-7 mx-1 flex items-center justify-center text-foreground/30 hover:text-foreground/60 transition-colors cursor-pointer rounded-[6px] hover:bg-foreground/5 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <ChevronUp className="h-4 w-4" />
+            </button>
+          ) : (
+            <div className="flex-1" />
+          )}
 
           {/* Right side: Model + Send - never shrink so they're always visible */}
           <div className="flex items-center shrink-0">
@@ -1918,45 +2044,94 @@ export function FreeFormInput({
                     {connectionUnavailable ? (
                       <>
                         <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-                        Unavailable
+                        {t('common.unavailable')}
                       </>
                     ) : (
                       <>
                         {effectiveConnectionDetails && llmConnections.length > 1 && storage.get(storage.KEYS.showConnectionIcons, true) && <ConnectionIcon connection={effectiveConnectionDetails} size={14} showTooltip />}
                         {currentModelDisplayName}
-                        {!connectionDefaultModel && <ChevronDown className="h-3 w-3 opacity-50 shrink-0" />}
+                        {pickerMode !== 'locked-single' && <ChevronDown className="h-3 w-3 opacity-50 shrink-0" />}
                       </>
                     )}
                   </button>
                 </DropdownMenuTrigger>
               </TooltipTrigger>
               <TooltipContent side="top">
-Model
+                {t('common.model')}
               </TooltipContent>
             </Tooltip>
             <StyledDropdownMenuContent side="top" align="end" sideOffset={8} className="min-w-[260px]">
               {/* Connection unavailable message */}
-              {connectionUnavailable ? (
+              {pickerMode === 'unavailable' ? (
                 <div className="flex flex-col items-center justify-center py-6 px-4 text-center">
                   <AlertCircle className="h-8 w-8 text-destructive mb-2" />
-                  <div className="font-medium text-sm mb-1">Connection Unavailable</div>
+                  <div className="font-medium text-sm mb-1">{t('chat.connectionUnavailable')}</div>
                   <div className="text-xs text-muted-foreground">
-                    The connection used by this session has been removed. Create a new session to continue.
+                    {t('chat.connectionUnavailableDescription')}
                   </div>
                 </div>
-              ) : connectionDefaultModel ? (
-                <StyledDropdownMenuItem
-                  disabled
-                  className="flex items-center justify-between px-2 py-2 rounded-lg"
-                >
-                  <div className="text-left">
-                    <div className="font-medium text-sm">{stripPiPrefixForDisplay(connectionDefaultModel)}</div>
-                    <div className="text-xs text-muted-foreground">Connection default</div>
-                  </div>
-                  <Check className="h-3 w-3 text-foreground shrink-0 ml-3" />
-                </StyledDropdownMenuItem>
-              ) : isEmptySession && llmConnections.length > 1 ? (
-                /* Hierarchical view: Provider → Connection → Models (for new sessions with multiple connections) */
+              ) : pickerMode === 'locked-single' && connectionDefaultModel ? (
+                (() => {
+                  // Single-model pi_compat connection on a non-empty session (or
+                  // when there's only one connection, so no switcher to show).
+                  // Model row is disabled (locked to this session); vision toggle
+                  // remains interactive.
+                  const showVisionToggle =
+                    !!effectiveConnectionDetails && isCompatProvider(effectiveConnectionDetails.providerType)
+                  const visionOn = showVisionToggle && modelSupportsImages(effectiveConnectionDetails!, connectionDefaultModel)
+                  return (
+                    <StyledDropdownMenuItem
+                      disabled
+                      className="flex items-center justify-between px-2 py-2 rounded-lg"
+                    >
+                      <div className="text-left">
+                        <div className="font-medium text-sm">{stripPiPrefixForDisplay(connectionDefaultModel)}</div>
+                        <div className="text-xs text-muted-foreground">{t('chat.connectionDefault')}</div>
+                      </div>
+                      <div className="flex items-center gap-1 ml-3 shrink-0">
+                        {showVisionToggle && effectiveConnectionDetails && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span
+                                role="button"
+                                tabIndex={0}
+                                aria-label={visionOn
+                                  ? t('chat.modelPicker.supportsImagesOn')
+                                  : t('chat.modelPicker.supportsImagesOff')}
+                                className="inline-flex items-center justify-center p-1 rounded pointer-events-auto opacity-100 hover:bg-foreground/5 cursor-pointer"
+                                onClick={(e) => {
+                                  e.preventDefault()
+                                  e.stopPropagation()
+                                  handleToggleModelVision(effectiveConnectionDetails.slug, connectionDefaultModel, !visionOn)
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault()
+                                    e.stopPropagation()
+                                    handleToggleModelVision(effectiveConnectionDetails.slug, connectionDefaultModel, !visionOn)
+                                  }
+                                }}
+                              >
+                                <ImageIcon className={cn(
+                                  "h-3.5 w-3.5",
+                                  visionOn ? "text-foreground/70" : "text-foreground/30"
+                                )} />
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {visionOn
+                                ? t('chat.modelPicker.supportsImagesOn')
+                                : t('chat.modelPicker.supportsImagesOff')}
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        <Check className="h-3 w-3 text-foreground" />
+                      </div>
+                    </StyledDropdownMenuItem>
+                  )
+                })()
+              ) : pickerMode === 'switcher' ? (
+                /* Hierarchical view: Provider → Connection → Models (empty session with multiple connections — lets the user switch BEFORE the first message locks the connection) */
                 connectionsByProvider.map(([providerName, connections], index) => (
                   <React.Fragment key={providerName}>
                     {/* Provider group label */}
@@ -1982,7 +2157,7 @@ Model
                                 {isCurrentConnection && <Check className="h-3 w-3 text-foreground" />}
                               </div>
                               {!isAuthenticated && (
-                                <div className="text-xs text-muted-foreground">Not authenticated</div>
+                                <div className="text-xs text-muted-foreground">{t('settings.ai.notAuthenticated')}</div>
                               )}
                             </div>
                           </StyledDropdownMenuSubTrigger>
@@ -1991,8 +2166,12 @@ Model
                               {/* Show models for this connection - use provider-specific models as fallback */}
                               {(conn.models || ANTHROPIC_MODELS).map((model) => {
                                 const modelId = typeof model === 'string' ? model : model.id
-                                const modelName = typeof model === 'string' ? stripPiPrefixForDisplay(getModelShortName(model)) : model.name
+                                const modelName = typeof model === 'string'
+                                  ? stripPiPrefixForDisplay(getModelShortName(model))
+                                  : (model.name ?? stripPiPrefixForDisplay(model.id))
                                 const isSelectedModel = isCurrentConnection && currentModel === modelId
+                                const showVisionToggle = isCompatProvider(conn.providerType)
+                                const visionOn = showVisionToggle && modelSupportsImages(conn, modelId)
                                 return (
                                   <StyledDropdownMenuItem
                                     key={modelId}
@@ -2007,9 +2186,47 @@ Model
                                     className="flex items-center justify-between px-2 py-2 rounded-lg cursor-pointer"
                                   >
                                     <div className="font-medium text-sm">{modelName}</div>
-                                    {isSelectedModel && (
-                                      <Check className="h-3 w-3 text-foreground shrink-0 ml-3" />
-                                    )}
+                                    <div className="flex items-center gap-1 ml-3 shrink-0">
+                                      {showVisionToggle && (
+                                        <Tooltip>
+                                          <TooltipTrigger asChild>
+                                            <span
+                                              role="button"
+                                              tabIndex={0}
+                                              aria-label={visionOn
+                                                ? t('chat.modelPicker.supportsImagesOn')
+                                                : t('chat.modelPicker.supportsImagesOff')}
+                                              className="inline-flex items-center justify-center p-1 rounded hover:bg-foreground/5 cursor-pointer"
+                                              onClick={(e) => {
+                                                e.preventDefault()
+                                                e.stopPropagation()
+                                                handleToggleModelVision(conn.slug, modelId, !visionOn)
+                                              }}
+                                              onKeyDown={(e) => {
+                                                if (e.key === 'Enter' || e.key === ' ') {
+                                                  e.preventDefault()
+                                                  e.stopPropagation()
+                                                  handleToggleModelVision(conn.slug, modelId, !visionOn)
+                                                }
+                                              }}
+                                            >
+                                              <ImageIcon className={cn(
+                                                "h-3.5 w-3.5",
+                                                visionOn ? "text-foreground/70" : "text-foreground/30"
+                                              )} />
+                                            </span>
+                                          </TooltipTrigger>
+                                          <TooltipContent>
+                                            {visionOn
+                                              ? t('chat.modelPicker.supportsImagesOn')
+                                              : t('chat.modelPicker.supportsImagesOff')}
+                                          </TooltipContent>
+                                        </Tooltip>
+                                      )}
+                                      {isSelectedModel && (
+                                        <Check className="h-3 w-3 text-foreground" />
+                                      )}
+                                    </div>
                                   </StyledDropdownMenuItem>
                                 )
                               })}
@@ -2038,10 +2255,15 @@ Model
                   {/* Model options based on effective connection's provider type */}
                   {availableModels.map((model) => {
                     const modelId = typeof model === 'string' ? model : model.id
-                    const modelName = typeof model === 'string' ? stripPiPrefixForDisplay(getModelShortName(model)) : model.name
+                    const modelName = typeof model === 'string'
+                      ? stripPiPrefixForDisplay(getModelShortName(model))
+                      : (model.name ?? stripPiPrefixForDisplay(model.id))
                     const isSelected = currentModel === modelId
                     const descriptionKey = typeof model !== 'string' && 'descriptionKey' in model ? (model.descriptionKey as string) : undefined
                     const description = descriptionKey ? t(descriptionKey) : (typeof model !== 'string' && 'description' in model ? (model.description as string) : '')
+                    const showVisionToggle =
+                      !!effectiveConnectionDetails && isCompatProvider(effectiveConnectionDetails.providerType)
+                    const visionOn = showVisionToggle && modelSupportsImages(effectiveConnectionDetails!, modelId)
                     return (
                       <StyledDropdownMenuItem
                         key={modelId}
@@ -2054,9 +2276,47 @@ Model
                             <div className="text-xs text-muted-foreground">{description}</div>
                           )}
                         </div>
-                        {isSelected && (
-                          <Check className="h-3 w-3 text-foreground shrink-0 ml-3" />
-                        )}
+                        <div className="flex items-center gap-1 ml-3 shrink-0">
+                          {showVisionToggle && effectiveConnectionDetails && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span
+                                  role="button"
+                                  tabIndex={0}
+                                  aria-label={visionOn
+                                    ? t('chat.modelPicker.supportsImagesOn')
+                                    : t('chat.modelPicker.supportsImagesOff')}
+                                  className="inline-flex items-center justify-center p-1 rounded hover:bg-foreground/5 cursor-pointer"
+                                  onClick={(e) => {
+                                    e.preventDefault()
+                                    e.stopPropagation()
+                                    handleToggleModelVision(effectiveConnectionDetails.slug, modelId, !visionOn)
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault()
+                                      e.stopPropagation()
+                                      handleToggleModelVision(effectiveConnectionDetails.slug, modelId, !visionOn)
+                                    }
+                                  }}
+                                >
+                                  <ImageIcon className={cn(
+                                    "h-3.5 w-3.5",
+                                    visionOn ? "text-foreground/70" : "text-foreground/30"
+                                  )} />
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                {visionOn
+                                  ? t('chat.modelPicker.supportsImagesOn')
+                                  : t('chat.modelPicker.supportsImagesOff')}
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
+                          {isSelected && (
+                            <Check className="h-3 w-3 text-foreground" />
+                          )}
+                        </div>
                       </StyledDropdownMenuItem>
                     )
                   })}
@@ -2178,7 +2438,7 @@ Model
               type="button"
               size="icon"
               variant="secondary"
-              aria-label="Stop response"
+              aria-label={t('chat.stopResponse')}
               className="send-btn h-7 w-7 rounded-full shrink-0 hover:bg-foreground/15 active:bg-foreground/20 ml-2"
               onClick={() => handleStop(false)}
             >
@@ -2188,7 +2448,7 @@ Model
             <Button
               type="submit"
               size="icon"
-              aria-label="Send message"
+              aria-label={t('shortcuts.sendMessage')}
               className="send-btn h-7 w-7 rounded-full shrink-0 ml-2"
               disabled={!hasContent || disabled || disableSend}
               data-tutorial="send-button"
@@ -2207,7 +2467,8 @@ Model
 /**
  * Format path for display, with home directory shortened
  */
-function formatPathForDisplay(path: string, homeDir: string): string {
+function formatPathForDisplay(path: string | undefined, homeDir: string): string {
+  if (!path) return ''
   let displayPath = path
   if (homeDir && path.startsWith(homeDir)) {
     const relativePath = path.slice(homeDir.length)
@@ -2237,98 +2498,49 @@ function WorkingDirectoryBadge({
   workspaceId?: string
 }) {
   const { t } = useTranslation()
-  const [recentDirs, setRecentDirs] = React.useState<string[]>([])
   const [popoverOpen, setPopoverOpen] = React.useState(false)
-  const [homeDir, setHomeDir] = React.useState<string>('')
-  const [gitBranch, setGitBranch] = React.useState<string | null>(null)
-  const [filter, setFilter] = React.useState('')
   const inputRef = React.useRef<HTMLInputElement>(null)
+  const closePopover = React.useCallback(() => setPopoverOpen(false), [])
 
-  // Load home directory and recent directories on mount
-  React.useEffect(() => {
-    setRecentDirs(getRecentWorkingDirs(workspaceId))
-    window.electronAPI?.getHomeDir?.().then((dir: string) => {
-      if (dir) setHomeDir(dir)
-    })
-  }, [workspaceId])
+  const {
+    homeDir,
+    gitBranch,
+    filter,
+    setFilter,
+    sortedRecent: filteredRecent,
+    hasFolder,
+    folderName,
+    showReset,
+    showFilter,
+    handleSelectRecent,
+    handleReset,
+    handleRemoveRecent,
+    handleChooseFolder,
+    serverBrowser: {
+      showServerBrowser,
+      serverBrowserMode,
+      cancelServerBrowser,
+      confirmServerBrowser,
+    },
+  } = useWorkingDirectoryState({
+    workingDirectory,
+    onWorkingDirectoryChange,
+    sessionFolderPath,
+    workspaceId,
+    isOpen: popoverOpen,
+    onClose: closePopover,
+  })
 
-  // Fetch git branch when working directory changes
+  // Autofocus the filter input on popover open. Lives in the consumer (not
+  // the hook) because the compact drawer surface has no autofocus.
   React.useEffect(() => {
-    if (workingDirectory) {
-      window.electronAPI?.getGitBranch?.(workingDirectory).then((branch: string | null) => {
-        setGitBranch(branch)
-      })
-    } else {
-      setGitBranch(null)
-    }
-  }, [workingDirectory])
-
-  // Reset filter, refresh history, and focus input when popover opens
-  React.useEffect(() => {
-    if (popoverOpen) {
-      setFilter('')
-      setRecentDirs(getRecentWorkingDirs(workspaceId))
-      // Focus input after popover animation completes (only if filter is shown)
+    if (popoverOpen && showFilter) {
       const timer = setTimeout(() => {
         inputRef.current?.focus()
       }, 0)
       return () => clearTimeout(timer)
     }
-  }, [popoverOpen, workspaceId])
-
-  const handleFolderSelected = React.useCallback((selectedPath: string) => {
-    setRecentDirs(addRecentWorkingDir(selectedPath, workspaceId))
-    onWorkingDirectoryChange(selectedPath)
-  }, [onWorkingDirectoryChange, workspaceId])
-
-  const {
-    pickDirectory,
-    showServerBrowser,
-    serverBrowserMode,
-    cancelServerBrowser,
-    confirmServerBrowser,
-  } = useDirectoryPicker(handleFolderSelected)
-
-  const handleChooseFolder = () => {
-    setPopoverOpen(false)
-    pickDirectory()
-  }
-
-  const handleSelectRecent = (path: string) => {
-    setRecentDirs(addRecentWorkingDir(path, workspaceId)) // Move to top of recent list
-    onWorkingDirectoryChange(path)
-    setPopoverOpen(false)
-  }
-
-  const handleReset = () => {
-    if (sessionFolderPath) {
-      onWorkingDirectoryChange(sessionFolderPath)
-      setPopoverOpen(false)
-    }
-  }
-
-  const handleRemoveRecent = (e: React.MouseEvent, path: string) => {
-    e.stopPropagation() // Don't trigger the item's onSelect
-    setRecentDirs(removeRecentWorkingDir(path, workspaceId))
-  }
-
-  // Filter out current directory from recent list and sort alphabetically by folder name
-  const filteredRecent = recentDirs
-    .filter(p => p !== workingDirectory)
-    .sort((a, b) => {
-      const nameA = getPathBasename(a).toLowerCase()
-      const nameB = getPathBasename(b).toLowerCase()
-      return nameA.localeCompare(nameB)
-    })
-  // Show filter input only when more than 5 recent folders
-  const showFilter = filteredRecent.length > 5
-
-  // Determine label - "Work in Folder" if not set or at session root, otherwise folder name
-  const hasFolder = !!workingDirectory && workingDirectory !== sessionFolderPath
-  const folderName = hasFolder ? (getPathBasename(workingDirectory) || 'Folder') : 'Work in Folder'
-
-  // Show reset option when a folder is selected and it differs from session folder
-  const showReset = hasFolder && sessionFolderPath && sessionFolderPath !== workingDirectory
+  }, [popoverOpen, showFilter])
 
   // Styles matching todo-filter-menu.tsx for consistency
   const MENU_CONTAINER_STYLE = 'min-w-[200px] max-w-[400px] overflow-hidden rounded-[8px] bg-background text-foreground shadow-modal-small p-0'
@@ -2342,7 +2554,7 @@ function WorkingDirectoryBadge({
         <span className="shrink min-w-0 overflow-hidden">
           <FreeFormInputContextBadge
             icon={<Icon_Home className="h-4 w-4" />}
-            label={folderName}
+            label={folderName ?? 'Work in Folder'}
             isExpanded={isEmptySession}
             hasSelection={hasFolder}
             showChevron={true}
@@ -2414,6 +2626,7 @@ function WorkingDirectoryBadge({
                   <button
                     type="button"
                     onClick={(e) => handleRemoveRecent(e, path)}
+                    data-touch-reveal="true"
                     className="shrink-0 h-3 w-3 rounded-[3px] flex items-center justify-center opacity-0 group-hover/item:opacity-100 text-muted-foreground hover:text-foreground hover:bg-foreground/10 transition-all"
                   >
                     <X className="h-3 w-3" />

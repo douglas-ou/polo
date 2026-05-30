@@ -73,6 +73,7 @@ import { navigate, routes } from "@/lib/navigate"
 import { CHAT_LAYOUT } from "@/config/layout"
 import { collectFileChangesFromActivities, getFirstFileChangeIdForActivity } from "@/lib/file-changes"
 import { resolveBranchNewPanelOption } from "./branching"
+import { handleErrorMessageAction } from "./error-message-actions"
 
 // ============================================================================
 // CSS Custom Highlight API helper
@@ -172,6 +173,10 @@ interface ChatDisplayProps {
   inputValue?: string
   /** Callback when input value changes */
   onInputChange?: (value: string) => void
+  /** Persisted attachment draft for this session (hydrated from disk in ChatPage) */
+  attachmentsValue?: FileAttachment[]
+  /** Callback when attachment draft changes (add, remove, clear on send) */
+  onAttachmentsChange?: (attachments: FileAttachment[]) => void
   // Source selection
   /** Available sources (enabled only) */
   sources?: LoadedSource[]
@@ -202,6 +207,12 @@ interface ChatDisplayProps {
   // Lazy loading
   /** When true, messages are still loading - show spinner in messages area */
   messagesLoading?: boolean
+  /** Message load failure shown instead of an infinite spinner */
+  messagesLoadError?: string | null
+  /** Whether a retry is currently in flight */
+  messagesRetrying?: boolean
+  /** Retry lazy-loading the session transcript */
+  onRetryMessagesLoad?: () => void
   // Tutorial
   /** Disable send action (for tutorial guidance) */
   disableSend?: boolean
@@ -212,9 +223,15 @@ interface ChatDisplayProps {
   isSearchModeActive?: boolean
   /** Callback when match info changes - for immediate UI updates */
   onMatchInfoChange?: (info: { count: number; index: number; isHighlighting: boolean; sessionId: string | null }) => void
-  // Compact mode (for EditPopover embedding)
+  // Compact mode (for EditPopover embedding and auto-compact / WebUI mobile)
   /** Enable compact mode - hides non-essential UI elements for popover embedding */
   compactMode?: boolean
+  /**
+   * When compactMode is true, enable the compact (drawer-based) model selector
+   * next to the permission-mode pill. Defaults to false so EditPopover keeps
+   * its current behavior; ChatPage opts in when in auto-compact / mobile.
+   */
+  enableCompactModelPicker?: boolean
   /** Custom placeholder for input (used in compact mode for edit context) */
   placeholder?: string | string[]
   /** Label shown as empty state in compact mode (e.g., "Permission Settings") */
@@ -223,83 +240,12 @@ interface ChatDisplayProps {
   connectionUnavailable?: boolean
 }
 
-type PendingFollowUpAnnotation = {
-  messageId: string
-  annotationId: string
-  note: string
-  selectedText: string
-  createdAt: number
-  color?: string
-  meta?: Record<string, unknown>
-}
-
-function normalizeExcerptForMessage(text: string, maxLength = 280): string {
-  const normalized = normalizeFollowUpText(text)
-  if (normalized.length <= maxLength) return normalized
-  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`
-}
-
-function formatFollowUpSection(
-  followUps: PendingFollowUpAnnotation[],
-  options?: { includeTopSeparator?: boolean }
-): string {
-  if (followUps.length === 0) return ''
-
-  const includeTopSeparator = options?.includeTopSeparator ?? true
-
-  const items = followUps.map((followUp, idx) => {
-    const quoteText = normalizeExcerptForMessage(followUp.selectedText)
-    return [
-      `> [#${idx + 1}] ${quoteText}`,
-      `→ ${followUp.note}`,
-    ].join('\n')
-  })
-
-  const body = ['**Follow-ups**', items.join('\n\n---\n\n')].join('\n\n')
-  return includeTopSeparator ? `---\n\n${body}` : body
-}
-
-function normalizeFollowUpsMarkdown(message: string): string {
-  const normalizedInput = message.replace(/\r\n/g, '\n')
-  const headingMatch = /(?:\*\*Follow-ups\*\*|Follow-up annotations:)/i.exec(normalizedInput)
-  if (!headingMatch || headingMatch.index == null) return message
-
-  const headingIndex = headingMatch.index
-  const beforeHeading = normalizedInput.slice(0, headingIndex).trimEnd()
-  const hasTrailingSeparator = /(?:^|\n)\s*---\s*$/.test(beforeHeading)
-  const sectionText = normalizedInput.slice(headingIndex)
-
-  // Remove heading and optional leading separator so we can parse items robustly.
-  const body = sectionText
-    .replace(/^\s*(?:---\s*)?(?:\*\*Follow-ups\*\*|Follow-up annotations:)\s*/i, '')
-
-  const itemRegex = />?\s*\[#(\d+)\]\s*([\s\S]*?)\s*→\s*([\s\S]*?)(?=(?:\s*---\s*>?\s*\[#\d+\])|$)/g
-  const parsedItems: Array<{ quote: string; note: string }> = []
-
-  for (const match of body.matchAll(itemRegex)) {
-    const quote = match[2]?.replace(/\s+/g, ' ').trim()
-    const note = match[3]?.replace(/\s+/g, ' ').trim()
-    if (!quote || !note) continue
-    parsedItems.push({ quote, note })
-  }
-
-  if (parsedItems.length === 0) {
-    return message
-  }
-
-  const rebuiltItems = parsedItems.map((item, idx) => [
-    `> [#${idx + 1}] ${item.quote}`,
-    `→ ${item.note}`,
-  ].join('\n'))
-
-  const includeTopSeparator = beforeHeading.length > 0 && !hasTrailingSeparator
-  const rebuiltBody = ['**Follow-ups**', rebuiltItems.join('\n\n---\n\n')].join('\n\n')
-  const rebuiltSection = includeTopSeparator
-    ? `---\n\n${rebuiltBody}`
-    : rebuiltBody
-
-  return beforeHeading.length > 0 ? `${beforeHeading}\n\n${rebuiltSection}` : rebuiltSection
-}
+import {
+  formatFollowUpSection,
+  normalizeFollowUpsMarkdown,
+  truncateForChipTooltip,
+  type PendingFollowUpAnnotation,
+} from './ChatDisplay.follow-ups'
 
 /**
  * Imperative handle exposed via forwardRef for navigation between matches
@@ -512,6 +458,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // Input value preservation
   inputValue,
   onInputChange,
+  attachmentsValue,
+  onAttachmentsChange,
   // Sources
   sources,
   onSourcesChange,
@@ -530,14 +478,18 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   sessionFolderPath,
   // Lazy loading
   messagesLoading = false,
+  messagesLoadError,
+  messagesRetrying = false,
+  onRetryMessagesLoad,
   // Tutorial
   disableSend = false,
   // Search highlighting
   searchQuery: externalSearchQuery,
   isSearchModeActive = false,
   onMatchInfoChange,
-  // Compact mode (for EditPopover embedding)
+  // Compact mode (for EditPopover embedding and auto-compact / WebUI mobile)
   compactMode = false,
+  enableCompactModelPicker = false,
   placeholder,
   emptyStateLabel,
   // Connection unavailable
@@ -711,7 +663,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     if (!searchQuery.trim() || !session?.messages) return []
     const startTime = performance.now()
     const query = searchQuery.toLowerCase()
-    const turns = groupMessagesByTurn(session.messages)
+    const turns = groupMessagesByTurn(session.messages, { isSessionProcessing: session.isProcessing })
     const matches: { matchId: string; turnId: string; turnIndex: number; matchIndexInTurn: number }[] = []
 
     for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
@@ -752,7 +704,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
       }
     }
     return matches
-  }, [searchQuery, session?.messages, countOccurrences])
+  }, [searchQuery, session?.messages, session?.isProcessing, countOccurrences])
 
   // Auto-expand pagination when search is active to show all matching turns
   // This ensures match count is stable and all matches are highlightable from the start
@@ -764,7 +716,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
       (min, m) => m.turnIndex < min ? m.turnIndex : min,
       matchingOccurrences[0]!.turnIndex
     )
-    const totalTurns = groupMessagesByTurn(session?.messages || []).length
+    const totalTurns = groupMessagesByTurn(session?.messages || [], { isSessionProcessing: session?.isProcessing }).length
 
     // Calculate how many turns we need to show to include all matches
     // totalTurns - visibleTurnCount = startIndex, so we need visibleTurnCount = totalTurns - earliestMatchTurnIndex + buffer
@@ -773,7 +725,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     if (requiredVisibleCount > visibleTurnCount) {
       setVisibleTurnCount(requiredVisibleCount)
     }
-  }, [isSearchActive, matchingOccurrences, session?.messages, visibleTurnCount])
+  }, [isSearchActive, matchingOccurrences, session?.messages, session?.isProcessing, visibleTurnCount])
 
   // Extract unique turn IDs that have matches (for highlighting)
   const matchingTurnIds = useMemo(() => {
@@ -1134,8 +1086,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
       messageId: followUp.messageId,
       annotationId: followUp.annotationId,
       index: idx + 1,
-      noteLabel: normalizeExcerptForMessage(followUp.note, 140),
-      selectedText: normalizeExcerptForMessage(followUp.selectedText, 260),
+      noteLabel: normalizeFollowUpText(followUp.note),
+      selectedText: truncateForChipTooltip(followUp.selectedText, 260),
       color: followUp.color,
     }))
   }, [pendingFollowUpAnnotations])
@@ -1420,8 +1372,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // Memoize turn grouping - avoids O(n) iteration on every render/keystroke
   const allTurns = React.useMemo(() => {
     if (!session) return []
-    return groupMessagesByTurn(session.messages)
-  }, [session?.messages])
+    return groupMessagesByTurn(session.messages, { isSessionProcessing: session.isProcessing })
+  }, [session?.messages, session?.isProcessing])
 
   // Keep ref in sync for scroll handler
   totalTurnCountRef.current = allTurns.length
@@ -1517,6 +1469,9 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // At render time, prevSessionIdForScrollRef still has the OLD session ID, so we can detect the switch
   const isSessionSwitchForScroll = prevSessionIdForScrollRef.current !== null && prevSessionIdForScrollRef.current !== session?.id
   const skipScrollToBottom = isSessionSwitchForScroll && isSearchActive
+  const hasUnrenderedLoadedMessages = !messagesLoading
+    && turns.length === 0
+    && ((session?.messages?.length ?? 0) > 0 || (session?.messageCount ?? 0) > 0)
 
   return (
     <div ref={zoneRef} className="flex h-full flex-col min-w-0" data-focus-zone="chat">
@@ -1549,8 +1504,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                     exit={{ opacity: 0 }}
                     transition={compactMode ? { duration: 0 } : { duration: 0.1, ease: 'easeOut' }}
                   >
-                    {/* Loading/Content AnimatePresence: Handles spinner ↔ content transition */}
-                    <AnimatePresence mode={compactMode ? "sync" : "wait"} initial={false}>
+                    {/* Loading/Content AnimatePresence: sync mode avoids stale loading exits masking ready content */}
+                    <AnimatePresence mode="sync" initial={false}>
                     {messagesLoading ? (
                       /* Loading State: Show spinner while messages are being lazy loaded */
                       <motion.div
@@ -1562,6 +1517,37 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                         className="flex items-center justify-center h-64"
                       >
                         <Spinner className="text-foreground/30" />
+                      </motion.div>
+                    ) : messagesLoadError ? (
+                      <motion.div
+                        key="load-error"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={compactMode ? { duration: 0 } : { duration: 0.1 }}
+                        className="flex items-center justify-center h-64 px-4"
+                      >
+                        <div
+                          className="max-w-sm rounded-[8px] border border-destructive/20 px-4 py-3 text-center shadow-tinted"
+                          style={{
+                            backgroundColor: 'oklch(from var(--destructive) l c h / 0.03)',
+                            '--shadow-color': 'var(--destructive-rgb)',
+                          } as React.CSSProperties}
+                        >
+                          <AlertTriangle className="mx-auto mb-2 h-4 w-4 text-destructive/70" />
+                          <div className="text-sm font-medium text-destructive">Failed to load conversation</div>
+                          <p className="mt-1 break-words text-xs text-destructive/70">{messagesLoadError}</p>
+                          {onRetryMessagesLoad && (
+                            <button
+                              type="button"
+                              onClick={onRetryMessagesLoad}
+                              disabled={messagesRetrying}
+                              className="mt-3 rounded border border-destructive/20 px-2 py-0.5 text-xs text-destructive/70 transition-colors hover:border-destructive/40 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {messagesRetrying ? 'Retrying…' : 'Retry'}
+                            </button>
+                          )}
+                        </div>
                       </motion.div>
                     ) : (
                     /* Turn-based Message Display - memoized to avoid re-grouping on every render */
@@ -1587,6 +1573,15 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                     <div className="absolute inset-0 flex flex-col items-center justify-center select-none gap-1 pointer-events-none">
                       <span className="text-sm text-muted-foreground">{t("editPopover.whatToChange")}</span>
                       <span className="text-xs text-muted-foreground/50">{t("editPopover.justDescribe")}</span>
+                    </div>
+                  )}
+                  {!compactMode && hasUnrenderedLoadedMessages && (
+                    <div className="flex h-64 items-center justify-center px-4 text-center">
+                      <div className="max-w-sm rounded-[8px] border border-border/50 bg-foreground/[0.03] px-4 py-3">
+                        <CircleAlert className="mx-auto mb-2 h-4 w-4 text-foreground/50" />
+                        <div className="text-sm font-medium text-foreground/70">Conversation loaded, but no renderable messages were found.</div>
+                        <p className="mt-1 text-xs text-foreground/50">Try reloading the session. If this persists, the message history may contain an unsupported format.</p>
+                      </div>
                     </div>
                   )}
                   {/* Load more indicator - shown when there are older messages */}
@@ -1619,6 +1614,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                             message={turn.message}
                             onOpenFile={onOpenFile}
                             onOpenUrl={onOpenUrl}
+                            sessionId={session?.id}
                             compactMode={compactMode}
                           />
                         </div>
@@ -1641,6 +1637,16 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                             message={turn.message}
                             onOpenFile={onOpenFile}
                             onOpenUrl={onOpenUrl}
+                            sessionId={session?.id}
+                            onRetry={turn.message.role === 'error' ? () => {
+                              const msgs = session?.messages
+                              if (!msgs) return
+                              const errorIdx = msgs.findIndex(m => m.id === turn.message.id)
+                              const lastUserMsg = msgs.slice(0, errorIdx).findLast(m => m.role === 'user')
+                              if (lastUserMsg) {
+                                onSendMessage(lastUserMsg.content)
+                              }
+                            } : undefined}
                           />
                         </div>
                       )
@@ -1921,10 +1927,13 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
               thinkingLevel,
               onThinkingLevelChange,
               enabledModes,
+              enableCompactModelPicker,
               structuredInput,
               onStructuredResponse: handleStructuredResponse,
               inputValue,
               onInputChange,
+              attachmentsValue,
+              onAttachmentsChange,
               sources,
               enabledSourceSlugs: session.enabledSourceSlugs,
               onSourcesChange,
@@ -2103,6 +2112,7 @@ interface MessageBubbleProps {
   message: Message
   onOpenFile: (path: string) => void
   onOpenUrl: (url: string) => void
+  sessionId?: string
   /**
    * Markdown render mode for assistant messages
    * @default 'minimal'
@@ -2114,12 +2124,14 @@ interface MessageBubbleProps {
   onPopOut?: (message: Message) => void
   /** Compact mode - reduces padding for popover embedding */
   compactMode?: boolean
+  /** Callback to resend the user message that preceded an error */
+  onRetry?: () => void
 }
 
 /**
  * ErrorMessage - Separate component for error messages to allow useState hook
  */
-function ErrorMessage({ message, onOpenUrl }: { message: Message; onOpenUrl?: (url: string) => void }) {
+function ErrorMessage({ message, onOpenUrl, sessionId, onRetry }: { message: Message; onOpenUrl?: (url: string) => void; sessionId?: string; onRetry?: () => void }) {
   const { t } = useTranslation()
   const hasDetails = (message.errorDetails && message.errorDetails.length > 0) || message.errorOriginal
   const [detailsOpen, setDetailsOpen] = React.useState(false)
@@ -2150,14 +2162,11 @@ function ErrorMessage({ message, onOpenUrl }: { message: Message; onOpenUrl?: (u
               <button
                 key={action.key}
                 onClick={() => {
-                  if (action.action === 'open_url' && action.url && onOpenUrl) {
-                    onOpenUrl(action.url)
-                  } else if (action.action === 'settings') {
-                    navigate(routes.view.settings())
-                  } else if (action.action === 'retry') {
-                    // Focus the chat input so user can re-send
-                    document.querySelector<HTMLTextAreaElement>('[data-chat-input]')?.focus()
-                  }
+                  handleErrorMessageAction(action, {
+                    sessionId,
+                    onOpenUrl,
+                    onRetry,
+                  })
                 }}
                 className="text-xs px-2 py-0.5 rounded border border-destructive/20 text-destructive/70 hover:text-destructive hover:border-destructive/40 transition-colors"
               >
@@ -2199,9 +2208,11 @@ function MessageBubble({
   message,
   onOpenFile,
   onOpenUrl,
+  sessionId,
   renderMode = 'minimal',
   onPopOut,
   compactMode,
+  onRetry,
 }: MessageBubbleProps) {
   const { t } = useTranslation()
 
@@ -2230,6 +2241,7 @@ function MessageBubble({
           {onPopOut && !message.isStreaming && (
             <button
               onClick={() => onPopOut(message)}
+              data-touch-reveal="true"
               className="absolute top-2 right-2 p-1.5 rounded-md opacity-0 group-hover:opacity-100 transition-opacity hover:bg-foreground/5"
               title={t("sidebarMenu.openInNewWindow")}
             >
@@ -2266,7 +2278,7 @@ function MessageBubble({
 
   // === ERROR MESSAGE: Red bordered bubble with warning icon and collapsible details ===
   if (message.role === 'error') {
-    return <ErrorMessage message={message} onOpenUrl={onOpenUrl} />
+    return <ErrorMessage message={message} onOpenUrl={onOpenUrl} sessionId={sessionId} onRetry={onRetry} />
   }
 
   // === STATUS MESSAGE: Matches ProcessingIndicator layout for visual consistency ===
@@ -2351,6 +2363,7 @@ const MemoizedMessageBubble = React.memo(MessageBubble, (prev, next) => {
     prev.message.id === next.message.id &&
     prev.message.content === next.message.content &&
     prev.message.role === next.message.role &&
+    prev.sessionId === next.sessionId &&
     prev.compactMode === next.compactMode
   )
 })

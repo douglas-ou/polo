@@ -1,4 +1,5 @@
 import * as React from "react"
+import i18next from "i18next"
 import type { Session, Message } from "../../shared/types"
 import type { SessionMeta } from "../atoms/sessions"
 import type { SessionStatusId } from "../config/session-status-config"
@@ -19,13 +20,22 @@ function sanitizePreview(content: string): string {
 }
 
 /**
+ * Display-layer fix for titles whose source title-cased a leading URL scheme
+ * (e.g. "Https://example.com" instead of "https://example.com"). Idempotent —
+ * returns identity when the title doesn't start with a known scheme.
+ */
+function normalizeTitleCasing(title: string): string {
+  return title.replace(/^(https?|mailto|file|ftp):/i, (m) => m.toLowerCase())
+}
+
+/**
  * Get display title for a session.
  * Priority: custom name > first user message > preview (from metadata) > "New chat"
  * Works with both Session (full) and SessionMeta (lightweight)
  */
 export function getSessionTitle(session: SessionLike | SessionMeta): string {
   if (session.name) {
-    return session.name
+    return normalizeTitleCasing(session.name)
   }
 
   // Check loaded messages first (only available on full Session)
@@ -35,7 +45,8 @@ export function getSessionTitle(session: SessionLike | SessionMeta): string {
       const sanitized = sanitizePreview(firstUserMessage.content)
       if (sanitized) {
         const trimmed = sanitized.slice(0, 50)
-        return trimmed.length < sanitized.length ? trimmed + '…' : trimmed
+        const truncated = trimmed.length < sanitized.length ? trimmed + '…' : trimmed
+        return normalizeTitleCasing(truncated)
       }
     }
   }
@@ -45,11 +56,12 @@ export function getSessionTitle(session: SessionLike | SessionMeta): string {
     const sanitized = sanitizePreview(session.preview)
     if (sanitized) {
       const trimmed = sanitized.slice(0, 50)
-      return trimmed.length < sanitized.length ? trimmed + '…' : trimmed
+      const truncated = trimmed.length < sanitized.length ? trimmed + '…' : trimmed
+      return normalizeTitleCasing(truncated)
     }
   }
 
-  return 'New chat'
+  return i18next.t('session.defaultTitle', 'New chat')
 }
 
 /**
@@ -69,8 +81,32 @@ export function getSessionPreviewText(session: SessionLike | SessionMeta, maxLen
 
   const title = getSessionTitle(session).replace(/…$/, '').trim()
   const normalizedTitle = sanitizePreview(title)
-  if (normalizedTitle && sanitized.toLowerCase() === normalizedTitle.toLowerCase()) {
-    return null
+  if (normalizedTitle) {
+    const sanitizedLower = sanitized.toLowerCase()
+    const titleLower = normalizedTitle.toLowerCase()
+    // Hide preview entirely if it exactly matches the title.
+    if (sanitizedLower === titleLower) {
+      return null
+    }
+    // Strip leading title prefix so "https://… Analyze the article" → "Analyze the article".
+    if (sanitizedLower.startsWith(titleLower)) {
+      let remainder = sanitized.slice(normalizedTitle.length)
+      // If the title was truncated mid-token (e.g. mid-URL), the next character
+      // continues that same token. Eat the rest of it so we don't render
+      // "alyze the feature" — the tail of "Analyze" — as the new preview start.
+      const titleEnd = sanitized.charAt(normalizedTitle.length - 1)
+      const remainderHead = remainder.charAt(0)
+      if (titleEnd && remainderHead && /\S/.test(titleEnd) && /\S/.test(remainderHead)) {
+        const partialToken = remainder.match(/^\S+/)
+        if (partialToken) {
+          remainder = remainder.slice(partialToken[0].length)
+        }
+      }
+      remainder = remainder.replace(/^[\s\-–—:|·•]+/, '').trim()
+      if (!remainder) return null
+      const trimmed = remainder.slice(0, maxLength)
+      return trimmed.length < remainder.length ? `${trimmed.trimEnd()}…` : trimmed
+    }
   }
 
   const trimmed = sanitized.slice(0, maxLength)
@@ -156,19 +192,21 @@ export function hasMessagesMeta(session: SessionMeta): boolean {
 // ---------------------------------------------------------------------------
 
 /** Short relative time locale for date-fns formatDistanceToNowStrict.
- *  Produces compact strings: "7m", "2h", "3d", "2w", "5mo", "1y" */
+ *  Produces compact strings: "7m", "2h", "3d", "2w", "5mo", "1y"
+ *  Uses i18n keys (time.compact.*) so output is localized. */
 export const shortTimeLocale = {
   formatDistance: (token: string, count: number) => {
-    const units: Record<string, string> = {
-      xSeconds: `${count}s`,
-      xMinutes: `${count}m`,
-      xHours: `${count}h`,
-      xDays: `${count}d`,
-      xWeeks: `${count}w`,
-      xMonths: `${count}mo`,
-      xYears: `${count}y`,
+    const tokenToKey: Record<string, string> = {
+      xSeconds: 'time.compact.seconds',
+      xMinutes: 'time.compact.minutes',
+      xHours: 'time.compact.hours',
+      xDays: 'time.compact.days',
+      xWeeks: 'time.compact.weeks',
+      xMonths: 'time.compact.months',
+      xYears: 'time.compact.years',
     }
-    return units[token] || `${count}`
+    const key = tokenToKey[token]
+    return key ? i18next.t(key, { count }) : `${count}`
   },
 }
 

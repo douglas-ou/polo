@@ -32,7 +32,7 @@ export interface SkillMenuProps {
   skillName: string
   /** Callbacks */
   onOpenInNewWindow: () => void
-  onShowInFinder: () => void
+  onShowInFinder: () => void | Promise<void>
   onDelete?: () => void
   canShowInFinder?: boolean
   canDelete?: boolean
@@ -79,7 +79,7 @@ export function SkillMenu({
       {onSendToWorkspace && (
         <MenuItem onClick={onSendToWorkspace}>
           <Send className="h-3.5 w-3.5" />
-          <span className="flex-1">Send to Workspace</span>
+          <span className="flex-1">{t("sessionMenu.sendToWorkspace")}</span>
         </MenuItem>
       )}
 

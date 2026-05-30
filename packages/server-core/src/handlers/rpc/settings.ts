@@ -2,7 +2,9 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname } from 'path'
 import { RPC_CHANNELS } from '@craft-agent/shared/protocol'
 import { getPreferencesPath, getSessionDraft, setSessionDraft, deleteSessionDraft, getAllSessionDrafts, getWorkspaceByNameOrId, getDefaultThinkingLevel, setDefaultThinkingLevel } from '@craft-agent/shared/config'
-import { isValidThinkingLevel, normalizeThinkingLevel } from '@craft-agent/shared/agent/thinking-levels'
+import { isValidThinkingLevel, normalizeThinkingLevel, THINKING_LEVEL_IDS } from '@craft-agent/shared/agent/thinking-levels'
+
+const VALID_THINKING_LEVELS_LIST = THINKING_LEVEL_IDS.map(id => `'${id}'`).join(', ')
 import { getWorkspaceOrThrow } from '@craft-agent/server-core/handlers'
 import type { RpcServer } from '@craft-agent/server-core/transport'
 import type { HandlerDeps } from '../handler-deps'
@@ -52,12 +54,13 @@ export function registerSettingsHandlers(server: RpcServer, deps: HandlerDeps): 
 
   server.handle(RPC_CHANNELS.settings.SET_DEFAULT_THINKING_LEVEL, async (_ctx, level: string) => {
     if (!isValidThinkingLevel(level)) {
-      throw new Error(`Invalid thinking level: ${level}. Valid values: 'off', 'low', 'medium', 'high', 'max'`)
+      throw new Error(`Invalid thinking level: ${level}. Valid values: ${VALID_THINKING_LEVELS_LIST}`)
     }
     const success = setDefaultThinkingLevel(level)
     if (!success) {
       throw new Error('Failed to persist default thinking level')
     }
+    return { success: true }
   })
 
   // ============================================================
@@ -196,14 +199,14 @@ export function registerSettingsHandlers(server: RpcServer, deps: HandlerDeps): 
   // Session Drafts (persisted input text)
   // ============================================================
 
-  // Get draft text for a session
+  // Get draft for a session (text + attachment refs)
   server.handle(RPC_CHANNELS.drafts.GET, async (_ctx, sessionId: string) => {
     return getSessionDraft(sessionId)
   })
 
-  // Set draft text for a session (pass empty string to clear)
-  server.handle(RPC_CHANNELS.drafts.SET, async (_ctx, sessionId: string, text: string) => {
-    setSessionDraft(sessionId, text)
+  // Set draft for a session (empty drafts are cleared)
+  server.handle(RPC_CHANNELS.drafts.SET, async (_ctx, sessionId: string, draft: import('@craft-agent/shared/config').SessionDraft) => {
+    setSessionDraft(sessionId, draft)
   })
 
   // Delete draft for a session
@@ -308,6 +311,34 @@ export function registerSettingsHandlers(server: RpcServer, deps: HandlerDeps): 
   server.handle(RPC_CHANNELS.caching.SET_ENABLE_1M_CONTEXT, async (_ctx, enabled: boolean) => {
     const { setEnable1MContext } = await import('@craft-agent/shared/config/storage')
     setEnable1MContext(enabled)
+  })
+
+  // ============================================================
+  // RTK Token-Optimization Settings
+  // ============================================================
+
+  // Get rtk Bash-output compression setting
+  server.handle(RPC_CHANNELS.rtk.GET_ENABLED, async () => {
+    const { getRtkEnabled } = await import('@craft-agent/shared/config/storage')
+    return getRtkEnabled()
+  })
+
+  // Set rtk Bash-output compression setting
+  server.handle(RPC_CHANNELS.rtk.SET_ENABLED, async (_ctx, enabled: boolean) => {
+    const { setRtkEnabled } = await import('@craft-agent/shared/config/storage')
+    setRtkEnabled(enabled)
+  })
+
+  // Detect rtk installation (used by Settings UI to swap install prompt ↔ toggle)
+  server.handle(RPC_CHANNELS.rtk.GET_STATUS, async (_ctx, opts?: { forceRecheck?: boolean }) => {
+    const { getRtkStatus } = await import('@craft-agent/shared/agent')
+    return getRtkStatus(opts)
+  })
+
+  // Token-savings summary from `rtk gain --format json` (efficiency meter)
+  server.handle(RPC_CHANNELS.rtk.GET_GAIN, async () => {
+    const { getRtkGain } = await import('@craft-agent/shared/agent')
+    return getRtkGain()
   })
 
   // ============================================================

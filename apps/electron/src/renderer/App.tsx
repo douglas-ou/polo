@@ -4,6 +4,7 @@ import { useTheme } from '@/hooks/useTheme'
 import type { ThemeOverrides } from '@config/theme'
 import { useSetAtom, useStore, useAtomValue, useAtom } from 'jotai'
 import type { Session, Workspace, SessionEvent, Message, FileAttachment, StoredAttachment, PermissionRequest, CredentialRequest, CredentialResponse, SetupNeeds, SessionStatus, NewChatActionParams, ContentBadge, LlmConnectionWithStatus, PermissionModeState } from '../shared/types'
+import type { SessionDraft, DraftAttachmentRef } from '@craft-agent/shared/config'
 import type { SessionOptions, SessionOptionUpdates } from './hooks/useSessionOptions'
 import { defaultSessionOptions, mergeSessionOptions } from './hooks/useSessionOptions'
 import { generateMessageId } from '../shared/types'
@@ -26,7 +27,9 @@ import { useSession } from '@/hooks/useSession'
 import { useUpdateChecker } from '@/hooks/useUpdateChecker'
 import { NavigationProvider } from '@/contexts/NavigationContext'
 import { navigate, routes } from './lib/navigate'
+import { attachmentFromContentRef, toDraftRef } from './lib/drafts'
 import { stripMarkdown } from './utils/text'
+import { coerceInputText } from './lib/input-text'
 import { getSessionsToRefreshAfterStaleReconnect } from './lib/reconnect-recovery'
 import { formatSessionLoadFailure, shouldTreatSessionLoadFailureAsTransportFallback } from './lib/session-load'
 import { extractWorkspaceSlugFromPath } from '@craft-agent/shared/utils/workspace-slug'
@@ -37,6 +40,8 @@ import {
   addSessionAtom,
   removeSessionAtom,
   updateSessionAtom,
+  replaceLoadedSessionAtom,
+  refreshSessionsMetadataAtom,
   sessionAtomFamily,
   sessionMetaMapAtom,
   sessionIdsAtom,
@@ -65,6 +70,7 @@ import { useTransportConnectionState } from '@/hooks/useTransportConnectionState
 import { useStaleSessionRecovery } from '@/hooks/useStaleSessionRecovery'
 import { TransportConnectionBanner, shouldShowTransportConnectionBanner } from '@/components/app-shell/TransportConnectionBanner'
 import { getFileManagerName } from '@/lib/platform'
+import { rendererLog } from '@/lib/logger'
 import { ActionRegistryProvider } from '@/actions'
 import { toast } from 'sonner'
 
@@ -72,6 +78,32 @@ type AppState = 'loading' | 'onboarding' | 'reauth' | 'workspace-picker' | 'read
 
 /** Type for the Jotai store returned by useStore() */
 type JotaiStore = ReturnType<typeof getDefaultStore>
+
+type SessionListRefreshOptions = {
+  removeMissing?: boolean
+  reason?: string
+  selectedSessionId?: string | null
+}
+
+const SESSION_REFRESH_LOG_ID_LIMIT = 25
+
+function summarizeIds(ids: Iterable<string>, limit = SESSION_REFRESH_LOG_ID_LIMIT) {
+  const all = Array.from(ids)
+  return {
+    count: all.length,
+    ids: all.slice(0, limit),
+    truncated: all.length > limit,
+  }
+}
+
+function workspaceDistribution(sessions: Iterable<{ workspaceId?: string }>): Record<string, number> {
+  const distribution: Record<string, number> = {}
+  for (const session of sessions) {
+    const key = session.workspaceId || '(missing)'
+    distribution[key] = (distribution[key] ?? 0) + 1
+  }
+  return distribution
+}
 
 /**
  * Helper to handle background task events from the agent.
@@ -213,6 +245,7 @@ export default function App() {
   const addSession = useSetAtom(addSessionAtom)
   const removeSession = useSetAtom(removeSessionAtom)
   const updateSessionDirect = useSetAtom(updateSessionAtom)
+  const replaceLoadedSession = useSetAtom(replaceLoadedSessionAtom)
   const store = useStore()
 
   // Helper to update a session by ID with partial fields
@@ -272,10 +305,11 @@ export default function App() {
   const [pendingPermissions, setPendingPermissions] = useState<Map<string, PermissionRequest[]>>(new Map())
   // Credential requests per session (queue to handle multiple concurrent requests)
   const [pendingCredentials, setPendingCredentials] = useState<Map<string, CredentialRequest[]>>(new Map())
-  // Draft input text per session (preserved across mode switches and conversation changes)
-  // Using ref instead of state to avoid re-renders during typing - drafts are only
-  // needed for initial value restoration and disk persistence, not reactive updates
-  const sessionDraftsRef = useRef<Map<string, string>>(new Map())
+  // Draft composer state per session (text + attachment refs), preserved across mode
+  // switches, conversation changes, and app restarts. Using a ref avoids re-renders
+  // during typing; attachments are stored as lightweight refs (path + name) and
+  // hydrated via readFileAttachment() on session switch.
+  const sessionDraftsRef = useRef<Map<string, SessionDraft>>(new Map())
   // Unified session options for all session-scoped settings
   const [sessionOptions, setSessionOptions] = useState<Map<string, SessionOptions>>(new Map())
 
@@ -418,7 +452,7 @@ export default function App() {
         : fresh
 
       clearStreamingState(sessionId)
-      updateSessionDirect(sessionId, () => nextSession)
+      replaceLoadedSession(nextSession)
       syncSessionOptionsFromSession(nextSession)
       void reconcilePermissionModeState(sessionId)
       return preservedStaleMessages ? 'preserved_stale_messages' : 'refreshed'
@@ -426,7 +460,7 @@ export default function App() {
       console.error(`[App] Failed to refresh session ${sessionId}:`, err)
       return 'failed'
     }
-  }, [clearStreamingState, updateSessionDirect, syncSessionOptionsFromSession, reconcilePermissionModeState, store])
+  }, [clearStreamingState, replaceLoadedSession, syncSessionOptionsFromSession, reconcilePermissionModeState, store])
 
   const loadSessionsFromServer = useCallback(async () => {
     setSessionLoadError(null)
@@ -480,66 +514,73 @@ export default function App() {
     }
   }, [initializeSessions, initialSessionId, reconcilePermissionModeState, windowWorkspaceId])
 
-  const refreshSessionListMetadataFromServer = useCallback(async (): Promise<Map<string, SessionMeta> | null> => {
+  const refreshSessionListMetadataFromServer = useCallback(async (options: SessionListRefreshOptions = {}): Promise<Map<string, SessionMeta> | null> => {
+    const {
+      removeMissing = true,
+      reason = 'manual-or-authoritative',
+      selectedSessionId = null,
+    } = options
+    const beforeMetaMap = store.get(sessionMetaMapAtom)
+    const beforeIds = new Set(beforeMetaMap.keys())
+    const transportState = await window.electronAPI.getTransportConnectionState().catch(() => null)
+
     try {
       const sessions = await window.electronAPI.getSessions()
+      const returnedIds = new Set(sessions.map(s => s.id))
+      const missingIds = Array.from(beforeIds).filter(id => !returnedIds.has(id))
+      const addedIds = sessions.map(s => s.id).filter(id => !beforeIds.has(id))
+      const logPayload = {
+        reason,
+        removeMissing,
+        windowWorkspaceId,
+        windowRemoteWorkspaceId,
+        selectedSessionId,
+        beforeCount: beforeIds.size,
+        returnedCount: sessions.length,
+        beforeIds: summarizeIds(beforeIds),
+        returnedIds: summarizeIds(returnedIds),
+        missingIds: summarizeIds(missingIds),
+        addedIds: summarizeIds(addedIds),
+        beforeWorkspaceIds: workspaceDistribution(beforeMetaMap.values()),
+        returnedWorkspaceIds: workspaceDistribution(sessions),
+        transportState,
+      }
+
+      rendererLog.info('[App] Session list metadata refresh result', logPayload)
+      if (!removeMissing && missingIds.length > 0) {
+        rendererLog.warn('[App] Non-destructive refresh preserved sessions omitted by getSessions(); this indicates a partial backend response or workspace-context mismatch', logPayload)
+      }
+
       const loadedSessionIds = store.get(loadedSessionsAtom)
-      const currentIds = store.get(sessionIdsAtom)
-      const latestIds = new Set(sessions.map(session => session.id))
 
-      for (const staleSessionId of currentIds) {
-        if (!latestIds.has(staleSessionId)) {
-          removeSession(staleSessionId)
-        }
-      }
+      // Single transactional atom write — all cross-atom mutations happen
+      // inside one Jotai write function so React subscribers see one
+      // consistent update instead of intermediate states.
+      const nextMetaMap = store.set(refreshSessionsMetadataAtom, { sessions, loadedSessionIds, removeMissing })
 
-      const unloadedIds: string[] = []
+      // Sync app-level state (React hooks / non-atom concerns) after the atom transaction
       for (const session of sessions) {
-        const currentSession = store.get(sessionAtomFamily(session.id))
-        const shouldPreserveMessages = !!currentSession && loadedSessionIds.has(session.id)
-        const nextSession = shouldPreserveMessages && currentSession
-          ? {
-              ...session,
-              messages: currentSession.messages,
-            }
-          : session
-
-        store.set(sessionAtomFamily(session.id), nextSession)
-
-        // Track sessions written without messages so lazy-loading re-fetches them
-        if (!shouldPreserveMessages && loadedSessionIds.has(session.id)) {
-          unloadedIds.push(session.id)
-        }
-
         syncSessionOptionsFromSession(session)
-        void reconcilePermissionModeState(session.id)
       }
-
-      // Remove from loadedSessionsAtom so ensureSessionMessagesLoaded will re-fetch
-      if (unloadedIds.length > 0) {
-        const nextLoaded = new Set(store.get(loadedSessionsAtom))
-        for (const id of unloadedIds) nextLoaded.delete(id)
-        store.set(loadedSessionsAtom, nextLoaded)
-      }
-
-      const nextMetaMap = new Map<string, SessionMeta>()
-      for (const session of sessions) {
-        nextMetaMap.set(session.id, extractSessionMeta(session))
-      }
-      store.set(sessionMetaMapAtom, nextMetaMap)
-
-      const nextIds = sessions
-        .slice()
-        .sort((a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0))
-        .map(session => session.id)
-      store.set(sessionIdsAtom, nextIds)
+      await Promise.allSettled(sessions.map(s => reconcilePermissionModeState(s.id)))
 
       return nextMetaMap
     } catch (err) {
-      console.error('[App] Failed to refresh session list metadata after reconnect:', err)
+      rendererLog.error('[App] Failed to refresh session list metadata after reconnect:', {
+        reason,
+        removeMissing,
+        windowWorkspaceId,
+        windowRemoteWorkspaceId,
+        selectedSessionId,
+        beforeCount: beforeIds.size,
+        beforeIds: summarizeIds(beforeIds),
+        beforeWorkspaceIds: workspaceDistribution(beforeMetaMap.values()),
+        transportState,
+        error: err,
+      })
       return null
     }
-  }, [store, removeSession, syncSessionOptionsFromSession, reconcilePermissionModeState])
+  }, [store, syncSessionOptionsFromSession, reconcilePermissionModeState, windowWorkspaceId, windowRemoteWorkspaceId])
 
   // Stale session watchdog — catches stuck sessions that the reconnect protocol misses
   const { trackSessionActivity } = useStaleSessionRecovery({
@@ -686,7 +727,9 @@ export default function App() {
       setLlmConnections(connections)
       setDefaultLlmConnectionSlug(resolveDefaultConnectionSlug(connections))
     })
-    // Load persisted input drafts into ref (no re-render needed)
+    // Load persisted input drafts into ref (no re-render needed).
+    // Attachment files are not read here — hydration happens lazily when the session
+    // is opened so app startup isn't delayed by reading potentially large files.
     window.electronAPI.getAllDrafts().then((drafts) => {
       if (Object.keys(drafts).length > 0) {
         sessionDraftsRef.current = new Map(Object.entries(drafts))
@@ -790,23 +833,15 @@ export default function App() {
             })
             break
           }
-          case 'auto_retry': {
-            // A source was auto-activated, automatically re-send the original message
-            // Add suffix to indicate the source was activated
-            const messageWithSuffix = `${effect.originalMessage}\n\n[${effect.sourceSlug} activated]`
-            // Use setTimeout to ensure the previous turn has fully completed
-            setTimeout(() => {
-              window.electronAPI.sendMessage(effect.sessionId, messageWithSuffix)
-            }, 100)
-            break
-          }
           case 'restore_input': {
             // Queued messages were removed from chat on abort — restore their text to the input field.
             // Append to existing draft (user may have started typing) rather than overwrite.
-            const existingDraft = sessionDraftsRef.current.get(sessionId) ?? ''
-            const restored = existingDraft
-              ? `${existingDraft}\n\n${effect.text}`
-              : effect.text
+            const existingDraft = sessionDraftsRef.current.get(sessionId)
+            const existingText = coerceInputText(existingDraft?.text)
+            const restoredText = coerceInputText(effect.text)
+            const restored = existingText
+              ? `${existingText}\n\n${restoredText}`
+              : restoredText
             handleInputChange(sessionId, restored)
             // handleInputChange updates the ref but ChatPage has local state.
             // Dispatch a custom event so ChatPage re-reads the draft.
@@ -856,11 +891,7 @@ export default function App() {
             if (createdSession) {
               const existingMeta = store.get(sessionMetaMapAtom).has(sessionId)
               if (existingMeta) {
-                updateSessionDirect(sessionId, () => createdSession)
-                const metaMap = store.get(sessionMetaMapAtom)
-                const nextMetaMap = new Map(metaMap)
-                nextMetaMap.set(sessionId, extractSessionMeta(createdSession))
-                store.set(sessionMetaMapAtom, nextMetaMap)
+                replaceLoadedSession(createdSession)
               } else {
                 addSession(createdSession)
               }
@@ -977,6 +1008,7 @@ export default function App() {
     windowWorkspaceId,
     store,
     updateSessionDirect,
+    replaceLoadedSession,
     showSessionNotification,
     initializeSessions,
     addSession,
@@ -998,7 +1030,11 @@ export default function App() {
 
       console.warn('[App] Stale reconnect — refreshing session metadata and active/processing sessions')
 
-      const refreshedMetaMap = await refreshSessionListMetadataFromServer()
+      const refreshedMetaMap = await refreshSessionListMetadataFromServer({
+        removeMissing: false,
+        reason: 'stale-reconnect',
+        selectedSessionId: sessionSelection.selected,
+      })
       const metaMap = refreshedMetaMap ?? store.get(sessionMetaMapAtom)
       const refreshIds = getSessionsToRefreshAfterStaleReconnect(metaMap, sessionSelection.selected)
 
@@ -1160,6 +1196,11 @@ export default function App() {
 
   const handleSendMessage = useCallback(async (sessionId: string, message: string, attachments?: FileAttachment[], skillSlugs?: string[], externalBadges?: ContentBadge[]) => {
     try {
+      // Capture pre-send processing state so we can flag mid-stream sends
+      // for the queued badge (#616 follow-up — covers Pi steer path which
+      // returns status 'accepted', not 'queued').
+      const sendingMidStream = store.get(sessionAtomFamily(sessionId))?.isProcessing === true
+
       // Step 1: Store attachments and get persistent metadata
       let storedAttachments: StoredAttachment[] | undefined
       let processedAttachments: FileAttachment[] | undefined
@@ -1271,7 +1312,13 @@ export default function App() {
       }
 
       // Step 5: Create user message with StoredAttachments (for UI display)
-      // Mark as isPending for optimistic UI - will be confirmed by user_message event
+      // Mark as isPending for optimistic UI — will be confirmed by user_message
+      // event. Flag mid-stream sends as queued so the bubble renders with the
+      // dashed-draft treatment immediately. Applies to both backends:
+      // Pi steers (server emits status: 'accepted' but the renderer preserves
+      // isQueued through that update) and Claude queues (server emits 'queued'
+      // which confirms it). Cleared by 'processing' status or when the current
+      // turn ends.
       const userMessage: Message = {
         id: generateMessageId(),
         role: 'user',
@@ -1280,6 +1327,7 @@ export default function App() {
         attachments: storedAttachments,
         badges: badges.length > 0 ? badges : undefined,
         isPending: true,  // Optimistic - will be confirmed by backend
+        isQueued: sendingMidStream,
       }
 
       // Optimistic UI update - add user message and set processing state
@@ -1346,31 +1394,108 @@ export default function App() {
     }
   }, [])
 
-  // Getter for draft values - reads from ref without triggering re-renders
+  // Getter for draft text - reads from ref without triggering re-renders
   const getDraft = useCallback((sessionId: string): string => {
-    return sessionDraftsRef.current.get(sessionId) ?? ''
+    const draft = sessionDraftsRef.current.get(sessionId) as unknown
+    const text = draft && typeof draft === 'object'
+      ? (draft as { text?: unknown }).text
+      : draft
+    return coerceInputText(text)
   }, [])
 
-  const handleInputChange = useCallback((sessionId: string, value: string) => {
-    // Update ref immediately (no re-render triggered)
-    if (value) {
-      sessionDraftsRef.current.set(sessionId, value)
-    } else {
-      sessionDraftsRef.current.delete(sessionId) // Clean up empty drafts
-    }
+  // Getter for persisted attachment refs (path + name only — not hydrated files).
+  // Consumers that need FileAttachment objects should call hydrateDraftAttachments.
+  const getDraftAttachmentRefs = useCallback((sessionId: string): DraftAttachmentRef[] => {
+    const attachments = sessionDraftsRef.current.get(sessionId)?.attachments
+    return Array.isArray(attachments) ? attachments : []
+  }, [])
 
-    // Debounced persistence to disk (500ms delay)
+  // Hydrate persisted attachment refs into full FileAttachment objects.
+  //  - Track C (ref.content set): reconstruct directly from the inlined bytes.
+  //  - Track P (path-only): re-read from disk via the readUserAttachment RPC.
+  // Missing/moved files on Track P are silently dropped with a console warn — same
+  // UX as any other editor draft restore when the backing file is gone.
+  const hydrateDraftAttachments = useCallback(async (sessionId: string): Promise<FileAttachment[]> => {
+    const attachments = sessionDraftsRef.current.get(sessionId)?.attachments
+    const refs = Array.isArray(attachments) ? attachments : []
+    if (refs.length === 0) return []
+    const results = await Promise.all(
+      refs.map(async (ref) => {
+        if (ref.content) {
+          return attachmentFromContentRef(ref)
+        }
+        try {
+          const attachment = await window.electronAPI.readUserAttachment(ref.path)
+          if (!attachment) {
+            console.warn('[drafts] Attachment missing on restore, dropping:', ref.path)
+            return null
+          }
+          return attachment
+        } catch (err) {
+          console.warn('[drafts] Failed to restore attachment, dropping:', ref.path, err)
+          return null
+        }
+      })
+    )
+    return results.filter((a): a is FileAttachment => a !== null)
+  }, [])
+
+  // Write a debounced snapshot of the current ref entry to disk.
+  const schedulePersistDraft = useCallback((sessionId: string) => {
     const existingTimeout = draftSaveTimeoutRef.current.get(sessionId)
     if (existingTimeout) {
       clearTimeout(existingTimeout)
     }
-
     const timeout = setTimeout(() => {
-      window.electronAPI.setDraft(sessionId, value)
+      const draft = sessionDraftsRef.current.get(sessionId) ?? { text: '' }
+      window.electronAPI.setDraft(sessionId, draft)
       draftSaveTimeoutRef.current.delete(sessionId)
     }, DRAFT_SAVE_DEBOUNCE_MS)
     draftSaveTimeoutRef.current.set(sessionId, timeout)
   }, [])
+
+  const handleInputChange = useCallback((sessionId: string, value: string) => {
+    const text = coerceInputText(value)
+    const existing = sessionDraftsRef.current.get(sessionId)
+    const existingAttachments = Array.isArray(existing?.attachments) ? existing.attachments : []
+    const nextDraft: SessionDraft = {
+      text,
+      ...(existingAttachments.length > 0
+        ? { attachments: existingAttachments }
+        : {}),
+    }
+    const isEmpty = !nextDraft.text && (!nextDraft.attachments || nextDraft.attachments.length === 0)
+    if (isEmpty) {
+      sessionDraftsRef.current.delete(sessionId)
+    } else {
+      sessionDraftsRef.current.set(sessionId, nextDraft)
+    }
+    schedulePersistDraft(sessionId)
+  }, [schedulePersistDraft])
+
+  const handleAttachmentsChange = useCallback((sessionId: string, attachments: FileAttachment[]) => {
+    const existing = sessionDraftsRef.current.get(sessionId)
+    const refs: DraftAttachmentRef[] = []
+    for (const a of attachments) {
+      const ref = toDraftRef(a)
+      if (ref) {
+        refs.push(ref)
+      } else {
+        console.warn('[drafts] attachment exceeds per-draft size cap, not persisted:', a.name, a.size)
+      }
+    }
+    const nextDraft: SessionDraft = {
+      text: coerceInputText(existing?.text),
+      ...(refs.length > 0 ? { attachments: refs } : {}),
+    }
+    const isEmpty = !nextDraft.text && (!nextDraft.attachments || nextDraft.attachments.length === 0)
+    if (isEmpty) {
+      sessionDraftsRef.current.delete(sessionId)
+    } else {
+      sessionDraftsRef.current.set(sessionId, nextDraft)
+    }
+    schedulePersistDraft(sessionId)
+  }, [schedulePersistDraft])
 
   // Open new chat - creates session and selects it
   // Used by components via AppShellContext and for programmatic navigation
@@ -1490,8 +1615,14 @@ export default function App() {
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown error'
         console.error('Failed to open URL:', error)
+        // The blocked-URL classifier already explains WHY and (for file:)
+        // points the user at preview blocks. Don't append the generic
+        // "use Open File instead" hint when the message already carries
+        // that guidance.
+        const hasRichGuidance = /URL blocked/.test(message)
+        const tail = hasRichGuidance ? '' : '. If this is a local path, use Open File instead.'
         toast.error(t('toast.failedToOpenLink'), {
-          description: `${message}. If this is a local path, use Open File instead.`,
+          description: `${message}${tail}`,
         })
       }
     },
@@ -1653,6 +1784,8 @@ export default function App() {
     pendingPermissions,
     pendingCredentials,
     getDraft,
+    getDraftAttachmentRefs,
+    hydrateDraftAttachments,
     sessionOptions,
     // Session callbacks
     onCreateSession: handleCreateSession,
@@ -1683,6 +1816,7 @@ export default function App() {
     // Session options
     onSessionOptionsChange: handleSessionOptionsChange,
     onInputChange: handleInputChange,
+    onAttachmentsChange: handleAttachmentsChange,
     // New chat (via deep link navigation)
     openNewChat,
   }), [
@@ -1696,6 +1830,8 @@ export default function App() {
     pendingPermissions,
     pendingCredentials,
     getDraft,
+    getDraftAttachmentRefs,
+    hydrateDraftAttachments,
     sessionOptions,
     handleCreateSession,
     handleSendMessage,
@@ -1721,6 +1857,7 @@ export default function App() {
     handleReset,
     handleSessionOptionsChange,
     handleInputChange,
+    handleAttachmentsChange,
     openNewChat,
   ])
 
@@ -1864,7 +2001,10 @@ export default function App() {
           )}
 
           {/* Main UI - always rendered, splash fades away to reveal it */}
-          <div className="h-full flex flex-col pt-[48px] text-foreground">
+          <div
+            className="h-full flex flex-col text-foreground"
+            style={{ paddingTop: 'var(--topbar-height)' }}
+          >
             {showTransportConnectionBanner && connectionState && (
               <TransportConnectionBanner
                 state={connectionState}

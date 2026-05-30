@@ -107,6 +107,13 @@ export interface CreateSessionOptions {
   name?: string
   permissionMode?: PermissionMode
   /**
+   * Reasoning/thinking level override. When set, takes precedence over workspace
+   * and global defaults. Silently ignored by the underlying SDK on non-reasoning
+   * models (e.g. gpt-4o) — provider drivers don't attach the reasoning param to
+   * the API request for models with `reasoning: false` in the Pi SDK catalog.
+   */
+  thinkingLevel?: ThinkingLevel
+  /**
    * Working directory for the session:
    * - 'user_default' or undefined: Use workspace's configured default working directory
    * - 'none': No working directory (session folder only)
@@ -306,7 +313,7 @@ export interface DirectoryListingResult {
 // ---------------------------------------------------------------------------
 
 export interface FileAttachment {
-  type: 'image' | 'text' | 'pdf' | 'office' | 'unknown'
+  type: 'image' | 'text' | 'pdf' | 'office' | 'audio' | 'unknown'
   path: string
   name: string
   mimeType: string
@@ -518,7 +525,7 @@ export interface ClaudeOAuthResult {
 // ---------------------------------------------------------------------------
 
 export type TestAutomationAction =
-  | { type: 'prompt'; prompt: string; llmConnection?: string; model?: string }
+  | { type: 'prompt'; prompt: string; llmConnection?: string; model?: string; thinkingLevel?: ThinkingLevel }
   | { type: 'webhook'; url: string; method?: string; headers?: Record<string, string>; bodyFormat?: 'json' | 'form' | 'raw'; body?: unknown; captureResponse?: boolean; auth?: { type: 'basic'; username: string; password: string } | { type: 'bearer'; token: string } }
 
 export interface TestAutomationPayload {
@@ -528,6 +535,8 @@ export interface TestAutomationPayload {
   actions: TestAutomationAction[]
   permissionMode?: PermissionMode
   labels?: string[]
+  /** Forwarded from the matcher; routes test-run sessions into a Telegram topic when paired. */
+  telegramTopic?: string
 }
 
 export type TestAutomationActionResult =
@@ -566,6 +575,14 @@ export interface BrowserInstanceInfo {
   isVisible: boolean
   agentControlActive: boolean
   themeColor: string | null
+  /**
+   * Workspace that owns this browser instance, or `null` for unbound manual
+   * windows. Renderers filter the tab strip / status badge by `activeWorkspaceId`
+   * so a session in workspace A doesn't see windows opened by workspace B.
+   * Missing/null entries always pass the filter — this keeps older renderers
+   * and main processes that pre-date the field working unchanged.
+   */
+  workspaceId?: string | null
 }
 
 export interface DeepLinkNavigation {
