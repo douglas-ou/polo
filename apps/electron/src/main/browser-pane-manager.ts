@@ -2103,10 +2103,15 @@ export class BrowserPaneManager implements IBrowserPaneManager {
     }
 
     this.destroyingIds.delete(instance.id)
-    this.closePopupsForParent(instance.id, 'parent_destroy')
-    this.applyAgentControlLock(instance, false)
-    this.updateNativeOverlayState(instance)
-    instance.cdp.detach()
+    const safeCleanup = (label: string, action: () => void): void => {
+      try { action() } catch (error) {
+        mainLog.warn(`[browser-pane] finalize cleanup failed id=${instance.id} step=${label} error=${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    safeCleanup('closePopupsForParent', () => this.closePopupsForParent(instance.id, 'parent_destroy'))
+    safeCleanup('applyAgentControlLock', () => this.applyAgentControlLock(instance, false))
+    safeCleanup('updateNativeOverlayState', () => this.updateNativeOverlayState(instance))
+    safeCleanup('cdp.detach', () => instance.cdp.detach())
     this.instances.delete(instance.id)
     this.removedCallback?.(instance.id)
     mainLog.info(`[browser-pane] Destroyed instance: ${instance.id} (${source})`)

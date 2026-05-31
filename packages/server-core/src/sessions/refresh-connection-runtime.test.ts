@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from 'bun:test'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { pathToFileURL } from 'url'
 import { resolveBackendContext } from '@craft-agent/shared/agent/backend'
 import { loadWorkspaceConfig } from '@craft-agent/shared/workspaces'
 import { SessionManager, createManagedSession } from './SessionManager.ts'
@@ -202,29 +203,142 @@ describe('refreshConnectionRuntime', () => {
     // pi_compat connection with explicit per-model `supportsImages`, the
     // helper must forward that field on `customModels` so the Pi subprocess
     // can re-register the model with `input: ['text', 'image']`.
-    const agent = createAgentStub()
-    injectSession(sm, 'shape-check', tmpRoot, 'slug-A', agent)
+    const seededSlug = '__test_shape_check__'
+    const configDir = join(tmpRoot, 'config-dir')
+    const workspaceRoot = join(tmpRoot, 'workspace')
+    mkdirSync(configDir, { recursive: true })
+    mkdirSync(workspaceRoot, { recursive: true })
+    writeFileSync(
+      join(workspaceRoot, 'config.json'),
+      JSON.stringify({
+        id: 'ws-config-shape-check',
+        name: 'Shape Check Workspace',
+        slug: 'shape-check',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }, null, 2),
+      'utf-8',
+    )
+    writeFileSync(
+      join(configDir, 'config.json'),
+      JSON.stringify({
+        workspaces: [{
+          id: 'ws-shape-check',
+          name: 'Shape Check Workspace',
+          rootPath: workspaceRoot,
+          createdAt: Date.now(),
+        }],
+        activeWorkspaceId: 'ws-shape-check',
+        activeSessionId: null,
+        defaultLlmConnection: seededSlug,
+        llmConnections: [{
+          slug: seededSlug,
+          name: 'Shape Check Test',
+          providerType: 'pi_compat',
+          authType: 'api_key',
+          baseUrl: 'https://test.example.com/v1',
+          models: [
+            { id: 'vision-model', supportsImages: true },
+            { id: 'text-only-model', supportsImages: false },
+            'plain-model',
+          ],
+          createdAt: Date.now(),
+        }],
+      }, null, 2),
+      'utf-8',
+    )
 
-    await sm.refreshConnectionRuntime('slug-A')
+    // CONFIG_DIR is captured when the shared config module is imported, so run
+    // this shape check in a fresh process with CRAFT_CONFIG_DIR already set.
+    const sessionManagerModule = pathToFileURL(join(import.meta.dir, 'SessionManager.ts')).href
+    const backendModule = pathToFileURL(join(import.meta.dir, '../../../shared/src/agent/backend/index.ts')).href
+    const workspacesModule = pathToFileURL(join(import.meta.dir, '../../../shared/src/workspaces/index.ts')).href
+    const runtimeConfigModule = pathToFileURL(join(import.meta.dir, 'runtime-config.ts')).href
+    const childScript = `
+      const [
+        { SessionManager, createManagedSession },
+        { resolveBackendContext },
+        { loadWorkspaceConfig },
+        { buildRestartRequiredSignature },
+      ] = await Promise.all([
+        import(${JSON.stringify(sessionManagerModule)}),
+        import(${JSON.stringify(backendModule)}),
+        import(${JSON.stringify(workspacesModule)}),
+        import(${JSON.stringify(runtimeConfigModule)}),
+      ])
 
-    expect(agent.updateRuntimeConfig).toHaveBeenCalledTimes(1)
-    const payload = agent.updateRuntimeConfig.mock.calls[0]?.[0]
-    expect(payload).toBeDefined()
-    expect(payload).toMatchObject({
-      model: expect.any(String),
-      runtime: expect.any(Object),
-    })
-    // The runtime envelope mirrors what `pi-agent.ts:requestRuntimeConfigUpdate`
-    // unpacks — `customModels` shape preserves `supportsImages` when set.
-    if (payload.runtime?.customModels) {
-      for (const m of payload.runtime.customModels) {
-        if (typeof m === 'object') {
-          expect(typeof m.id).toBe('string')
-          if ('supportsImages' in m) {
-            expect(typeof m.supportsImages).toBe('boolean')
-          }
-        }
+      const seededSlug = ${JSON.stringify(seededSlug)}
+      const workspaceRoot = ${JSON.stringify(workspaceRoot)}
+      const sm = new SessionManager()
+      let updateCalls = 0
+      let capturedPayload = null
+      const agent = {
+        isProcessing: () => false,
+        updateRuntimeConfig: async (payload) => {
+          updateCalls += 1
+          capturedPayload = JSON.parse(JSON.stringify(payload))
+          return true
+        },
+        dispose: () => {},
       }
+      const workspace = {
+        id: 'ws-shape-check',
+        name: 'Shape Check Workspace',
+        rootPath: workspaceRoot,
+        createdAt: Date.now(),
+      }
+      const managed = createManagedSession(
+        { id: 'shape-check', name: 'shape-check', llmConnection: seededSlug },
+        workspace,
+        { messagesLoaded: true },
+      )
+      managed.agent = agent
+      managed.backendRuntimeSignature = '__stale_runtime_signature_for_test__'
+      const workspaceConfig = loadWorkspaceConfig(workspaceRoot)
+      const ctx = resolveBackendContext({
+        sessionConnectionSlug: seededSlug,
+        workspaceDefaultConnectionSlug: workspaceConfig?.defaults?.defaultLlmConnection,
+      })
+      managed.backendRestartSignature = buildRestartRequiredSignature({
+        connection: ctx.connection,
+        provider: ctx.provider,
+        authType: ctx.authType,
+        resolvedModel: ctx.resolvedModel,
+      })
+      managed.isProcessing = false
+      managed.llmConnection = seededSlug
+      sm.sessions.set('shape-check', managed)
+
+      await sm.refreshConnectionRuntime(seededSlug)
+
+      if (updateCalls !== 1) {
+        throw new Error('expected one updateRuntimeConfig call, got ' + updateCalls)
+      }
+      if (!capturedPayload) throw new Error('expected updateRuntimeConfig payload')
+      if (typeof capturedPayload.model !== 'string') throw new Error('expected model string')
+      const runtime = capturedPayload.runtime
+      if (!runtime) throw new Error('expected runtime payload')
+      const expectedCustomModels = [
+        { id: 'vision-model', supportsImages: true },
+        { id: 'text-only-model', supportsImages: false },
+        'plain-model',
+      ]
+      const actualCustomModels = JSON.stringify(runtime.customModels)
+      const expected = JSON.stringify(expectedCustomModels)
+      if (actualCustomModels !== expected) {
+        throw new Error('expected customModels ' + expected + ', got ' + actualCustomModels)
+      }
+    `
+    const run = Bun.spawnSync([process.execPath, '--eval', childScript], {
+      env: { ...process.env, CRAFT_CONFIG_DIR: configDir },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+
+    if (run.exitCode !== 0) {
+      throw new Error(
+        `isolated shape check failed (exit ${run.exitCode})\nstdout:\n${run.stdout.toString()}\nstderr:\n${run.stderr.toString()}`,
+      )
     }
   })
 })
