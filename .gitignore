@@ -48,6 +48,7 @@ __pycache__/
 
 # Claude Code local settings (user-specific)
 .claude/settings.local.json
+.cursor/mcp.json
 
 # Accidental literal tilde directories (Node.js doesn't expand ~)
 ~/
